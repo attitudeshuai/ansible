@@ -7,13 +7,18 @@ from __future__ import annotations
 from copy import deepcopy
 
 from ansible.module_utils.datatag import deprecator_from_collection_name
+from ansible.module_utils._internal import _validation
 from ansible.module_utils.common.parameters import (
     _ADDITIONAL_CHECKS,
+    _ADDITIONAL_CHECK_CONSTRAINTS,
     _get_legal_inputs,
     _get_unsupported_parameters,
     _handle_aliases,
+    _json_native,
     _list_deprecations,
     _list_no_log_values,
+    _missing_required_arguments,
+    _mutually_exclusive_constraint,
     _set_defaults,
     _validate_argument_types,
     _validate_argument_values,
@@ -51,7 +56,7 @@ class ValidationResult:
     containing the validated parameters and any errors.
     """
 
-    def __init__(self, parameters):
+    def __init__(self, parameters, parameter_origins_seed=None):
         """
         :arg parameters: Terms to be validated and coerced to the correct type.
         :type parameters: dict
@@ -62,11 +67,16 @@ class ValidationResult:
         """
 
         self._unsupported_parameters = set()
+        self._unsupported_parameter_paths = []
         self._supported_parameters = dict()
         self._validated_parameters = deepcopy(parameters)
         self._deprecations = []
         self._warnings = []
         self._aliases = {}
+        self._parameter_origins_seed = parameter_origins_seed
+        self._parameter_origins: dict[tuple, _validation.ParameterOrigin] = {}
+        """Flat table of per-option origins keyed by structured option paths (str keys, int list indices)."""
+
         self.errors = AnsibleValidationErrorMultiple()
         """
         :class:`~ansible.module_utils.errors.AnsibleValidationErrorMultiple` containing all
@@ -88,6 +98,20 @@ class ValidationResult:
     def error_messages(self):
         """:class:`list` of all error messages from each exception in :attr:`errors`."""
         return self.errors.messages
+
+    @property
+    def error_details(self):
+        """:class:`list` of structured records for each validation error, in append order."""
+        return self.errors.details
+
+    @property
+    def parameter_origins(self):
+        """Origin of every validated parameter, structured like :attr:`validated_parameters`.
+
+        Dict options with sub specs nest into dicts and list-of-dict sub specs into per-element lists;
+        leaves are :class:`~ansible.module_utils._internal._validation.ParameterOrigin` objects.
+        """
+        return _validation.materialize_parameter_origins(self._validated_parameters, self._parameter_origins)
 
 
 class ArgumentSpecValidator:

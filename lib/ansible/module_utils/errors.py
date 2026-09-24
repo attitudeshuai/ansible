@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 
 class AnsibleFallbackNotFound(Exception):
     """Fallback validator was not found"""
@@ -12,21 +15,48 @@ class AnsibleFallbackNotFound(Exception):
 class AnsibleValidationError(Exception):
     """Single argument spec validation error"""
 
-    def __init__(self, message):
+    def __init__(
+        self,
+        message: str,
+        option_path: Sequence[str | int] | None = None,
+        rejected_value: Any = None,
+        constraint: dict[str, Any] | None = None,
+    ):
         super(AnsibleValidationError, self).__init__(message)
         self.error_message = message
         """The error message passed in when the exception was raised."""
+
+        # Path of option names and list indices identifying where the error occurred; empty tuple is the spec top level.
+        self.option_path = tuple(option_path or ())
+        # The rejected value; None when the error has no single rejected value (missing param, cross-param constraints).
+        self.rejected_value = rejected_value
+        # The violated declaration constraint projected to JSON-native data, or None for non-declaration errors.
+        self.constraint = constraint
 
     @property
     def msg(self):
         """The error message passed in when the exception was raised."""
         return self.args[0]
 
+    @property
+    def details(self) -> dict[str, Any]:
+        """Structured, JSON-native record describing the validation failure.
+
+        Contains the option path, error type (exception class name), unchanged message text, rejected value and constraint.
+        """
+        return {
+            'option_path': list(self.option_path),
+            'error_type': type(self).__name__,
+            'message': self.msg,
+            'rejected_value': self.rejected_value,
+            'constraint': self.constraint,
+        }
+
 
 class AnsibleValidationErrorMultiple(AnsibleValidationError):
     """Multiple argument spec validation errors"""
 
-    def __init__(self, errors=None):
+    def __init__(self, errors: list[AnsibleValidationError] | None = None):
         self.errors = errors[:] if errors else []
         """:class:`list` of :class:`AnsibleValidationError` objects"""
 
@@ -45,9 +75,14 @@ class AnsibleValidationErrorMultiple(AnsibleValidationError):
         return self.errors[0].args[0]
 
     @property
-    def messages(self):
+    def messages(self) -> list[str]:
         """:class:`list` of each error message in ``errors``."""
         return [err.msg for err in self.errors]
+
+    @property
+    def details(self) -> list[dict[str, Any]]:
+        """:class:`list` of structured records from each error in ``errors``, in append order."""
+        return [err.details for err in self.errors]
 
     def append(self, error):
         """Append a new error to ``self.errors``.

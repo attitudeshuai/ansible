@@ -21,7 +21,7 @@ from collections.abc import (
 from itertools import chain  # pylint: disable=unused-import
 
 from ansible.module_utils.common.collections import is_iterable
-from ansible.module_utils._internal import _no_six
+from ansible.module_utils._internal import _no_six, _validation
 from ansible.module_utils._internal._datatag import AnsibleSerializable, AnsibleTagHelper
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
 from ansible.module_utils.common.warnings import warn
@@ -61,6 +61,7 @@ from ansible.module_utils.common.validation import (
     check_type_path,
     check_type_raw,
     check_type_str,
+    count_terms,
 )
 from ansible.module_utils.common.warnings import deprecate as _deprecate
 
@@ -73,6 +74,110 @@ _ADDITIONAL_CHECKS = (
     {'func': check_required_if, 'attr': 'required_if', 'err': RequiredIfError},
     {'func': check_required_by, 'attr': 'required_by', 'err': RequiredByError},
 )
+
+
+def _json_native(value):
+    """Project declaration or parameter data to JSON-native structures for structured validation records."""
+    if isinstance(value, Mapping):
+        return {key: _json_native(sub_value) for key, sub_value in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_native(item) for item in value]
+    return value
+
+
+def _missing_required_arguments(argument_spec, parameters):
+    """Return the sorted names of required options absent from parameters, mirroring check_required_arguments."""
+    return sorted(name for name, spec in argument_spec.items() if spec.get('required', False) and name not in parameters)
+
+
+def _mutually_exclusive_constraint(terms, parameters):
+    """Structured constraint for the mutually exclusive groups that failed (same selection as the raised error)."""
+    if not terms:
+        return None
+
+    failing = [group for group in terms if count_terms(group, parameters) > 1]
+    if not failing:
+        return None
+
+    return {'mutually_exclusive': _json_native(failing)}
+
+
+def _required_together_constraint(terms, parameters):
+    """Structured constraint for the first required-together group that failed, mirroring the raised error."""
+    if not terms:
+        return None
+
+    for group in terms:
+        counts = [count_terms(option, parameters) for option in group]
+        if any(count > 0 for count in counts) and 0 in counts:
+            return {'required_together': _json_native(group)}
+
+    return None
+
+
+def _required_one_of_constraint(terms, parameters):
+    """Structured constraint for the first required-one-of group that failed, mirroring the raised error."""
+    if not terms:
+        return None
+
+    for group in terms:
+        if count_terms(group, parameters) == 0:
+            return {'required_one_of': _json_native(group)}
+
+    return None
+
+
+def _required_by_constraint(requirements, parameters):
+    """Structured constraint for the first required-by rule that failed, mirroring the raised error."""
+    if not requirements:
+        return None
+
+    for key, value in requirements.items():
+        if key not in parameters or parameters[key] is None:
+            continue
+
+        if isinstance(value, str):
+            value = [value]
+
+        if missing := [required for required in value if required not in parameters or parameters[required] is None]:
+            return {'required_by': {key: _json_native(missing)}}
+
+    return None
+
+
+def _required_if_constraint(requirements, parameters):
+    """Structured constraint for the first required-if rule that failed, mirroring the raised error."""
+    if not requirements:
+        return None
+
+    for requirement in requirements:
+        missing = []
+        max_missing_count = 0
+        is_one_of = False
+        if len(requirement) == 4:
+            key, val, required_options, is_one_of = requirement
+        else:
+            key, val, required_options = requirement
+
+        if is_one_of:
+            max_missing_count = len(required_options)
+
+        if key in parameters and parameters[key] == val:
+            for option in required_options:
+                if count_terms(option, parameters) == 0:
+                    missing.append(option)
+
+        if len(missing) and len(missing) >= max_missing_count:
+            return {'required_if': _json_native({
+                'parameter': key,
+                'value': val,
+                'requires': 'any' if is_one_of else 'all',
+                'requirements': required_options,
+                'missing': missing,
+            })}
+
+    return None
+
 
 # if adding boolean attribute, also add to PASS_BOOL
 # some of this dupes defaults from controller config
@@ -150,7 +255,8 @@ def _get_legal_inputs(argument_spec, parameters, aliases=None):
     return list(aliases.keys()) + list(argument_spec.keys())
 
 
-def _get_unsupported_parameters(argument_spec, parameters, legal_inputs=None, options_context=None, store_supported=None):
+def _get_unsupported_parameters(argument_spec, parameters, legal_inputs=None, options_context=None, store_supported=None,
+                               store_unsupported_paths=None, option_path=()):
     """Check keys in parameters against those provided in legal_inputs
     to ensure they contain legal values. If legal_inputs are not supplied,
     they will be generated using the argument_spec.
@@ -161,6 +267,8 @@ def _get_unsupported_parameters(argument_spec, parameters, legal_inputs=None, op
         in argument_spec.
     :arg options_context: List of parent keys for tracking the context of where
         a parameter is defined.
+    :kwarg store_unsupported_paths: When provided, appends each unsupported option's
+        structured path (including list indices) to this list.
 
     :returns: Set of unsupported parameters. Empty set if no unsupported parameters
         are found.
@@ -178,6 +286,9 @@ def _get_unsupported_parameters(argument_spec, parameters, legal_inputs=None, op
 
             unsupported_parameters.add(context)
 
+            if store_unsupported_paths is not None:
+                store_unsupported_paths.append(tuple(option_path) + (k,))
+
             if store_supported is not None:
                 supported_aliases = _handle_aliases(argument_spec, parameters)
                 supported_params = []
@@ -191,7 +302,8 @@ def _get_unsupported_parameters(argument_spec, parameters, legal_inputs=None, op
     return unsupported_parameters
 
 
-def _handle_aliases(argument_spec, parameters, alias_warnings=None, alias_deprecations=None):
+def _handle_aliases(argument_spec, parameters, alias_warnings=None, alias_deprecations=None,
+                    parameter_origins=None, origin_path=()):
     """Process aliases from an argument_spec including warnings and deprecations.
 
     Modify ``parameters`` by adding a new key for each alias with the supplied
@@ -243,6 +355,12 @@ def _handle_aliases(argument_spec, parameters, alias_warnings=None, alias_deprec
             if alias in parameters:
                 if k in parameters and alias_warnings is not None:
                     alias_warnings.append((k, alias))
+                # Attribute through the alias before the value is copied to the canonical name, so the
+                # origin reflects whichever alias carried the final value even when both are specified.
+                if parameter_origins is not None:
+                    alias_origin = _validation.ParameterOrigin(_validation.ORIGIN_ALIAS, alias=alias)
+                    _validation.record_parameter_origin(parameter_origins, tuple(origin_path) + (k,), alias_origin)
+                    _validation.record_parameter_origin(parameter_origins, tuple(origin_path) + (alias,), alias_origin)
                 parameters[k] = parameters[alias]
 
     return aliases_results
@@ -464,7 +582,7 @@ def _remove_values_conditions(value, no_log_strings, deferred_removals):
     return value
 
 
-def _set_defaults(argument_spec, parameters, set_default=True):
+def _set_defaults(argument_spec, parameters, set_default=True, parameter_origins=None, origin_path=(), nested=False):
     """Set default values for parameters when no value is supplied.
 
     Modifies parameters directly.
@@ -497,6 +615,12 @@ def _set_defaults(argument_spec, parameters, set_default=True):
                 no_log_values.add(default)
 
             parameters[param] = default
+
+            if parameter_origins is not None:
+                origin_kind = _validation.ORIGIN_SUB_SPEC_DEFAULT if nested else _validation.ORIGIN_DEFAULT
+                _validation.record_parameter_origin(
+                    parameter_origins, tuple(origin_path) + (param,), _validation.ParameterOrigin(origin_kind),
+                )
 
     return no_log_values
 
@@ -539,7 +663,7 @@ def _sanitize_keys_conditions(value, deferred_removals):
     raise TypeError('Value of unknown type: %s, %s' % (type(value), value))
 
 
-def _validate_elements(wanted_type, parameter, values, options_context=None, errors=None):
+def _validate_elements(wanted_type, parameter, values, options_context=None, errors=None, option_path=()):
 
     if errors is None:
         errors = AnsibleValidationErrorMultiple()
@@ -555,7 +679,7 @@ def _validate_elements(wanted_type, parameter, values, options_context=None, err
         elif isinstance(parameter, dict):
             kwargs['param'] = list(parameter.keys())[0]
 
-    for value in values:
+    for idx, value in enumerate(values):
         try:
             validated_parameters.append(type_checker(value, **kwargs))
         except (TypeError, ValueError) as e:
@@ -563,11 +687,16 @@ def _validate_elements(wanted_type, parameter, values, options_context=None, err
             if options_context:
                 msg += " found in '%s'" % " -> ".join(options_context)
             msg += " is of type %s and we were unable to convert to %s: %s" % (native_type_name(value), wanted_element_type, to_native(e))
-            errors.append(ElementError(msg))
+            errors.append(ElementError(
+                msg,
+                option_path=tuple(option_path) + (parameter, idx),
+                rejected_value=value,
+                constraint={'type': 'list', 'elements': wanted_element_type},
+            ))
     return validated_parameters
 
 
-def _validate_argument_types(argument_spec, parameters, prefix='', options_context=None, errors=None):
+def _validate_argument_types(argument_spec, parameters, prefix='', options_context=None, errors=None, option_path=()):
     """Validate that parameter types match the type in the argument spec.
 
     Determine the appropriate type checker function and run each
@@ -626,18 +755,30 @@ def _validate_argument_types(argument_spec, parameters, prefix='', options_conte
                     if options_context:
                         msg += " found in '%s'." % " -> ".join(options_context)
                     msg += ", elements value check is supported only with 'list' type"
-                    errors.append(ArgumentTypeError(msg))
-                parameters[param] = _validate_elements(elements_wanted_type, param, elements, options_context, errors)
+                    errors.append(ArgumentTypeError(
+                        msg,
+                        option_path=tuple(option_path) + (param,),
+                        rejected_value=elements,
+                        constraint={'type': wanted_name, 'elements': elements_wanted_type},
+                    ))
+                parameters[param] = _validate_elements(
+                    elements_wanted_type, param, elements, options_context, errors, option_path=option_path,
+                )
 
         except (TypeError, ValueError) as e:
             msg = "argument '%s' is of type %s" % (param, native_type_name(value))
             if options_context:
                 msg += " found in '%s'." % " -> ".join(options_context)
             msg += " and we were unable to convert to %s: %s" % (wanted_name, to_native(e))
-            errors.append(ArgumentTypeError(msg))
+            errors.append(ArgumentTypeError(
+                msg,
+                option_path=tuple(option_path) + (param,),
+                rejected_value=value,
+                constraint={'type': wanted_name},
+            ))
 
 
-def _validate_argument_values(argument_spec, parameters, options_context=None, errors=None):
+def _validate_argument_values(argument_spec, parameters, options_context=None, errors=None, option_path=()):
     """Ensure all arguments have the requested values, and there are no stray arguments"""
 
     if errors is None:
@@ -659,7 +800,12 @@ def _validate_argument_values(argument_spec, parameters, options_context=None, e
                         msg = "value of %s must be one or more of: %s. Got no match for: %s" % (param, choices_str, diff_str)
                         if options_context:
                             msg = "{0} found in {1}".format(msg, " -> ".join(options_context))
-                        errors.append(ArgumentValueError(msg))
+                        errors.append(ArgumentValueError(
+                            msg,
+                            option_path=tuple(option_path) + (param,),
+                            rejected_value=_json_native(diff_list),
+                            constraint={'choices': _json_native(list(choices))},
+                        ))
                 elif parameters[param] not in choices:
                     # PyYaml converts certain strings to bools. If we can unambiguously convert back, do so before checking
                     # the value. If we can't figure this out, module author is responsible.
@@ -679,12 +825,22 @@ def _validate_argument_values(argument_spec, parameters, options_context=None, e
                         msg = "value of %s must be one of: %s, got: %s" % (param, choices_str, parameters[param])
                         if options_context:
                             msg = "{0} found in {1}".format(msg, " -> ".join(options_context))
-                        errors.append(ArgumentValueError(msg))
+                        errors.append(ArgumentValueError(
+                            msg,
+                            option_path=tuple(option_path) + (param,),
+                            rejected_value=parameters[param],
+                            constraint={'choices': _json_native(list(choices))},
+                        ))
         else:
             msg = "internal error: choices for argument %s are not iterable: %s" % (param, choices)
             if options_context:
                 msg = "{0} found in {1}".format(msg, " -> ".join(options_context))
-            errors.append(ArgumentTypeError(msg))
+            errors.append(ArgumentTypeError(
+                msg,
+                option_path=tuple(option_path) + (param,),
+                rejected_value=parameters.get(param),
+                constraint={'choices': _json_native(choices)},
+            ))
 
 
 def _validate_sub_spec(
@@ -697,6 +853,10 @@ def _validate_sub_spec(
     unsupported_parameters=None,
     supported_parameters=None,
     alias_deprecations=None,
+    parameter_origins=None,
+    parameter_origins_seed=None,
+    option_path=(),
+    store_unsupported_paths=None,
 ):
     """Validate sub argument spec.
 
@@ -719,12 +879,20 @@ def _validate_sub_spec(
 
     for param, value in argument_spec.items():
         wanted = value.get('type')
-        if wanted == 'dict' or (wanted == 'list' and value.get('elements', '') == 'dict'):
+        is_list_sub_spec = wanted == 'list' and value.get('elements', '') == 'dict'
+        if wanted == 'dict' or is_list_sub_spec:
             sub_spec = value.get('options')
             if value.get('apply_defaults', False):
                 if sub_spec is not None:
                     if parameters.get(param) is None:
                         parameters[param] = {}
+                        if parameter_origins is not None and \
+                                _validation.get_recorded_origin(parameter_origins, tuple(option_path) + (param,)) is None:
+                            _validation.record_parameter_origin(
+                                parameter_origins,
+                                tuple(option_path) + (param,),
+                                _validation.ParameterOrigin(_validation.ORIGIN_SUB_SPEC_DEFAULT),
+                            )
                 else:
                     continue
             elif sub_spec is None or param not in parameters or parameters[param] is None:
@@ -740,10 +908,23 @@ def _validate_sub_spec(
                 elements = parameters[param]
 
             for idx, sub_parameters in enumerate(elements):
-                no_log_values.update(set_fallbacks(sub_spec, sub_parameters))
+                # Structured path to this element; list sub specs include the element index, dict sub specs do not.
+                element_path = tuple(option_path) + (param,)
+                if is_list_sub_spec:
+                    element_path += (idx,)
+
+                no_log_values.update(set_fallbacks(sub_spec, sub_parameters, parameter_origins, element_path))
 
                 if not isinstance(sub_parameters, dict):
-                    errors.append(SubParameterTypeError("value of '%s' must be of type dict or list of dicts" % param))
+                    sub_parameter_constraint = {'type': wanted}
+                    if is_list_sub_spec:
+                        sub_parameter_constraint['elements'] = 'dict'
+                    errors.append(SubParameterTypeError(
+                        "value of '%s' must be of type dict or list of dicts" % param,
+                        option_path=element_path,
+                        rejected_value=sub_parameters,
+                        constraint=sub_parameter_constraint,
+                    ))
                     continue
 
                 # Set prefix for warning messages
@@ -755,10 +936,13 @@ def _validate_sub_spec(
                 alias_warnings = []
                 alias_deprecations_sub = []
                 try:
-                    options_aliases = _handle_aliases(sub_spec, sub_parameters, alias_warnings, alias_deprecations_sub)
+                    options_aliases = _handle_aliases(
+                        sub_spec, sub_parameters, alias_warnings, alias_deprecations_sub,
+                        parameter_origins=parameter_origins, origin_path=element_path,
+                    )
                 except (TypeError, ValueError) as e:
                     options_aliases = {}
-                    errors.append(AliasError(to_native(e)))
+                    errors.append(AliasError(to_native(e), option_path=element_path))
 
                 for option, alias in alias_warnings:
                     warn('Both option %s%s and its alias %s%s are set.' % (new_prefix, option, new_prefix, alias))
@@ -775,7 +959,14 @@ def _validate_sub_spec(
                 try:
                     no_log_values.update(_list_no_log_values(sub_spec, sub_parameters))
                 except TypeError as te:
-                    errors.append(NoLogError(to_native(te)))
+                    errors.append(NoLogError(to_native(te), option_path=element_path))
+
+                # Attribute input values at this layer once alias/fallback provenance has already been recorded.
+                if parameter_origins is not None:
+                    for option_name in sub_parameters:
+                        _validation.ensure_input_parameter_origin(
+                            parameter_origins, element_path + (option_name,), parameter_origins_seed,
+                        )
 
                 legal_inputs = _get_legal_inputs(sub_spec, sub_parameters, options_aliases)
                 unsupported_parameters.update(
@@ -785,38 +976,72 @@ def _validate_sub_spec(
                         legal_inputs,
                         options_context,
                         store_supported=supported_parameters,
+                        store_unsupported_paths=store_unsupported_paths,
+                        option_path=element_path,
                     )
                 )
 
                 try:
                     check_mutually_exclusive(value.get('mutually_exclusive'), sub_parameters, options_context)
                 except TypeError as e:
-                    errors.append(MutuallyExclusiveError(to_native(e)))
+                    errors.append(MutuallyExclusiveError(
+                        to_native(e),
+                        option_path=element_path,
+                        constraint=_mutually_exclusive_constraint(value.get('mutually_exclusive'), sub_parameters),
+                    ))
 
-                no_log_values.update(_set_defaults(sub_spec, sub_parameters, False))
+                no_log_values.update(_set_defaults(
+                    sub_spec, sub_parameters, False, parameter_origins, element_path, nested=True,
+                ))
 
                 try:
                     check_required_arguments(sub_spec, sub_parameters, options_context)
                 except TypeError as e:
-                    errors.append(RequiredError(to_native(e)))
+                    missing = _missing_required_arguments(sub_spec, sub_parameters)
+                    errors.append(RequiredError(
+                        to_native(e),
+                        option_path=element_path,
+                        constraint={'required': missing} if missing else None,
+                    ))
 
-                _validate_argument_types(sub_spec, sub_parameters, new_prefix, options_context, errors=errors)
-                _validate_argument_values(sub_spec, sub_parameters, options_context, errors=errors)
+                _validate_argument_types(
+                    sub_spec, sub_parameters, new_prefix, options_context, errors=errors, option_path=element_path,
+                )
+                _validate_argument_values(
+                    sub_spec, sub_parameters, options_context, errors=errors, option_path=element_path,
+                )
 
                 for check in _ADDITIONAL_CHECKS:
                     try:
                         check['func'](value.get(check['attr']), sub_parameters, options_context)
                     except TypeError as e:
-                        errors.append(check['err'](to_native(e)))
+                        constraint = _ADDITIONAL_CHECK_CONSTRAINTS[check['attr']](value.get(check['attr']), sub_parameters)
+                        errors.append(check['err'](to_native(e), option_path=element_path, constraint=constraint))
 
-                no_log_values.update(_set_defaults(sub_spec, sub_parameters))
+                no_log_values.update(_set_defaults(
+                    sub_spec, sub_parameters, parameter_origins=parameter_origins,
+                    origin_path=element_path, nested=True,
+                ))
 
                 # Handle nested specs
                 _validate_sub_spec(
                     sub_spec, sub_parameters, new_prefix, options_context, errors, no_log_values,
-                    unsupported_parameters, supported_parameters, alias_deprecations)
+                    unsupported_parameters, supported_parameters, alias_deprecations,
+                    parameter_origins=parameter_origins,
+                    parameter_origins_seed=parameter_origins_seed,
+                    option_path=element_path,
+                    store_unsupported_paths=store_unsupported_paths,
+                )
 
             options_context.pop()
+
+
+_ADDITIONAL_CHECK_CONSTRAINTS = {
+    'required_together': _required_together_constraint,
+    'required_one_of': _required_one_of_constraint,
+    'required_if': _required_if_constraint,
+    'required_by': _required_by_constraint,
+}
 
 
 def env_fallback(*args, **kwargs):
@@ -828,7 +1053,7 @@ def env_fallback(*args, **kwargs):
     raise AnsibleFallbackNotFound
 
 
-def set_fallbacks(argument_spec, parameters):
+def set_fallbacks(argument_spec, parameters, parameter_origins=None, origin_path=()):
     no_log_values = set()
     for param, value in argument_spec.items():
         fallback = value.get('fallback', (None,))
@@ -849,6 +1074,16 @@ def set_fallbacks(argument_spec, parameters):
                 if value.get('no_log', False) and fallback_value:
                     no_log_values.add(fallback_value)
                 parameters[param] = fallback_value
+
+                if parameter_origins is not None:
+                    _validation.record_parameter_origin(
+                        parameter_origins,
+                        tuple(origin_path) + (param,),
+                        _validation.ParameterOrigin(
+                            _validation.ORIGIN_FALLBACK,
+                            fallback=getattr(fallback_strategy, '__name__', to_native(type(fallback_strategy))),
+                        ),
+                    )
 
     return no_log_values
 
