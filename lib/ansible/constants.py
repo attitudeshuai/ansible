@@ -126,6 +126,9 @@ TREE_DIR = None
 VAULT_VERSION_MIN = 1.0
 VAULT_VERSION_MAX = 1.0
 
+# seconds between enforcement attempts when async_overflow_policy is wait
+ASYNC_GOVERNANCE_WAIT_INTERVAL = 1.0
+
 # This matches a string that cannot be used as a valid python variable name i.e 'not-valid', 'not!valid@either' '1_nor_This'
 INVALID_VARIABLE_NAMES = re.compile(r'^[\d\W]|[^\w]')
 

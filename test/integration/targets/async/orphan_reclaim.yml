@@ -1,0 +1,43 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  async_orphan_policy: reclaim
+  tasks:
+    - block:
+        - name: write a job file abandoned by a previous run
+          copy:
+            dest: "{{ ansible_async_dir }}/jorph.99999"
+            content: '{"started": true, "finished": false, "ansible_job_id": "jorph.99999"}'
+
+        - name: submit a real job, triggering enforcement
+          command: sleep 1
+          async: 10
+          poll: 0
+          register: realjob
+
+        - name: abandoned file was reclaimed
+          stat:
+            path: "{{ ansible_async_dir }}/jorph.99999"
+          register: orphanstat
+
+        - assert:
+            that:
+              - not orphanstat.stat.exists
+
+        - name: query shows no abandoned jobs and records the orphan reclamation
+          async_governance:
+            mode: query
+          register: q
+
+        - assert:
+            that:
+              - q.orphaned_jobs == []
+              - q.last_reclamation.reclaimed_jobs[0].jid == 'jorph.99999'
+              - q.last_reclamation.reclaimed_jobs[0].reason == 'orphan_reclaimed'
+      always:
+        - name: clean up the real job
+          async_status:
+            jid: "{{ realjob.ansible_job_id }}"
+            mode: cleanup
+          when: realjob is defined and realjob.ansible_job_id is defined

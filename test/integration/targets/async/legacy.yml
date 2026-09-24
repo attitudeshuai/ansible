@@ -1,0 +1,5 @@
+---
+# Run the pre-existing role-style async keyword scenarios (tasks/main.yml).
+- hosts: localhosts
+  roles:
+    - async

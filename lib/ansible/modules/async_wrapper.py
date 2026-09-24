@@ -129,17 +129,24 @@ def jwrite(info):
         os.rename(jobfile, job_path)
 
 
-def _run_module(jid, *module_args):
+def _run_module(jid_prefix, *module_args):
 
     # DTFIX-FUTURE: needs rework for serialization profiles
+
+    # the job id encodes this module process, which stays alive until the job ends
+    jid = f"{jid_prefix}.{os.getpid()}"
+
+    global job_path
+    job_path = os.path.join(os.path.dirname(job_path), jid)
 
     jwrite({"started": True, "finished": False, "ansible_job_id": jid})
 
     result = {}
 
     # signal grandchild process started and isolated from being terminated
-    # by the connection being closed sending a signal to the job group
-    ipc_notifier.send(True)
+    # by the connection being closed sending a signal to the job group;
+    # relay the final job id back to the invoking process
+    ipc_notifier.send(jid)
     ipc_notifier.close()
 
     outdata = ''
@@ -212,7 +219,8 @@ def main():
                    "Humans, do not call directly!"
         }, 1)
 
-    jid = "%s.%d" % (sys.argv[1], os.getpid())
+    jid_prefix = sys.argv[1]
+    jid = "%s.%d" % (jid_prefix, os.getpid())
     time_limit = sys.argv[2]
     preserve_tmp = sys.argv[3].lower() == 'true'
     wrapped_module = sys.argv[4]
@@ -256,15 +264,24 @@ def main():
             # allow waiting up to 2.5 seconds in total should be long enough for worst
             # loaded environment in practice.
             retries = 25
+            started_jid = None
             while retries > 0:
                 if ipc_watcher.poll(0.1):
+                    started_jid = ipc_watcher.recv()
                     break
                 else:
                     retries = retries - 1
                     continue
 
+            if started_jid is None:
+                started_jid = jid
+                started_results_file = job_path
+            else:
+                started_results_file = os.path.join(os.path.dirname(job_path), started_jid)
+
             notice("Return async_wrapper task started.")
-            end({"failed": False, "started": True, "finished": False, "ansible_job_id": jid, "results_file": job_path,
+            end({"failed": False, "started": True, "finished": False, "ansible_job_id": started_jid,
+                 "results_file": started_results_file,
                  "_ansible_suppress_tmpdir_delete": (not preserve_tmp)}, 0)
         else:
             # The actual wrapper process
@@ -283,6 +300,10 @@ def main():
                 # close off inherited pipe handles
                 ipc_watcher.close()
                 ipc_notifier.close()
+
+                # the file for this job is named after the module process
+                global job_path
+                job_path = os.path.join(os.path.dirname(job_path), f"{jid_prefix}.{sub_pid}")
 
                 # the parent stops the process after the time limit
                 remaining = int(time_limit)
@@ -323,7 +344,7 @@ def main():
             else:
                 # the child process runs the actual module
                 notice("Start module (%s)" % os.getpid())
-                _run_module(jid, *invocation_args)
+                _run_module(jid_prefix, *invocation_args)
                 notice("Module complete (%s)" % os.getpid())
 
     except Exception as e:

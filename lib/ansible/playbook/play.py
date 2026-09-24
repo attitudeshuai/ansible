@@ -88,6 +88,14 @@ class Play(Base, Taggable, CollectionSearch):
     strategy = NonInheritableFieldAttribute(isa='string', default=C.DEFAULT_STRATEGY, always_post_validate=True)
     order = NonInheritableFieldAttribute(isa='string', always_post_validate=True)
 
+    # Async job governance (default off; see async_governance keyword)
+    async_governance = NonInheritableFieldAttribute(isa='bool', default=False, always_post_validate=True)
+    async_max_jobs = NonInheritableFieldAttribute(isa='int', default=0, always_post_validate=True)
+    async_job_ttl = NonInheritableFieldAttribute(isa='int', default=0, always_post_validate=True)
+    async_overflow_policy = NonInheritableFieldAttribute(isa='string', default='wait', always_post_validate=True)
+    async_orphan_policy = NonInheritableFieldAttribute(isa='string', default='warn', always_post_validate=True)
+    async_count_internal = NonInheritableFieldAttribute(isa='bool', default=False, always_post_validate=True)
+
     # =================================================================================
 
     def __init__(self):
@@ -132,6 +140,26 @@ class Play(Base, Taggable, CollectionSearch):
 
             elif not isinstance(value, (bytes, str, EncryptedString)):
                 raise AnsibleParserError("Hosts list must be a sequence or string. Please check your playbook.")
+
+    def _post_validate_async_max_jobs(self, attribute: NonInheritableFieldAttribute, value: int, templar: _TE) -> int:
+        if value < 0:
+            raise AnsibleParserError("async_max_jobs must be a non-negative integer; 0 means unlimited.", obj=self._ds)
+        return value
+
+    def _post_validate_async_job_ttl(self, attribute: NonInheritableFieldAttribute, value: int, templar: _TE) -> int:
+        if value < 0:
+            raise AnsibleParserError("async_job_ttl must be a non-negative integer; 0 disables reclamation.", obj=self._ds)
+        return value
+
+    def _post_validate_async_overflow_policy(self, attribute: NonInheritableFieldAttribute, value: str, templar: _TE) -> str:
+        if value not in ('wait', 'reject'):
+            raise AnsibleParserError("async_overflow_policy must be 'wait' or 'reject'.", obj=self._ds)
+        return value
+
+    def _post_validate_async_orphan_policy(self, attribute: NonInheritableFieldAttribute, value: str, templar: _TE) -> str:
+        if value not in ('warn', 'reclaim', 'fail'):
+            raise AnsibleParserError("async_orphan_policy must be 'warn', 'reclaim' or 'fail'.", obj=self._ds)
+        return value
 
     def get_name(self):
         """ return the name of the Play """

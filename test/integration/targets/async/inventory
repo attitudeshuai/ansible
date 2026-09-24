@@ -1,0 +1,7 @@
+[localhosts]
+testhost
+
+[localhosts:vars]
+ansible_connection=local
+ansible_python_interpreter="{{ ansible_playbook_python }}"
+ansible_async_dir="{{ lookup('env', 'ASYNC_TEST_DIR') }}"

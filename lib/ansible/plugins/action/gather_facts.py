@@ -152,7 +152,10 @@ class ActionModule(ActionBase):
                     self._task.async_val = 0
 
                 self._display.vvvv("Running %s" % fact_module)
-                jobs[fact_module] = (self._execute_module(module_name=fact_module, module_args=mod_args, task_vars=task_vars, wrap_async=True))
+                jobs[fact_module] = (self._execute_module(
+                    module_name=fact_module, module_args=mod_args, task_vars=task_vars, wrap_async=True,
+                    _governance_internal=True,
+                ))
 
             while jobs:
                 for module in jobs:

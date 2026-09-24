@@ -1,0 +1,44 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  async_max_jobs: 1
+  async_overflow_policy: reject
+  tasks:
+    - block:
+        - name: first job takes the only slot
+          command: sleep 30
+          async: 30
+          poll: 0
+          register: first
+
+        - name: second submission must be rejected
+          command: sleep 1
+          async: 30
+          poll: 0
+          register: second
+          ignore_errors: true
+
+        - assert:
+            that:
+              - second is failed
+              - second.async_rejected
+              - "'rejected' in second.msg"
+              - second.async_max_jobs == 1
+              - second.running_count == 1
+
+        # the rejected job left no status file on the target
+        - name: list job files
+          find:
+            paths: "{{ ansible_async_dir }}"
+          register: found
+
+        - assert:
+            that:
+              - found.files | length == 1
+      always:
+        - name: clean up the first job
+          async_status:
+            jid: "{{ first.ansible_job_id }}"
+            mode: cleanup
+          when: first is defined and first.ansible_job_id is defined

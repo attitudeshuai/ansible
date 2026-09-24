@@ -1,0 +1,47 @@
+---
+# Governance is default off; existing submit/poll/cleanup behavior is unchanged.
+- hosts: localhosts
+  gather_facts: false
+  tasks:
+    - name: async task polled to completion
+      command: sleep 1
+      async: 10
+      poll: 1
+      register: polled
+
+    - assert:
+        that:
+          - polled is success
+          - polled.ansible_job_id is defined
+
+    # the finished job file was removed automatically, no extra files remain
+    - name: list remaining job files
+      find:
+        paths: "{{ ansible_async_dir }}"
+      register: found
+
+    - assert:
+        that:
+          - found.files | length == 0
+
+    - name: fire-and-forget job
+      command: sleep 30
+      async: 30
+      poll: 0
+      register: fireforget
+
+    - assert:
+        that:
+          - fireforget is success
+          - fireforget.ansible_job_id is defined
+
+    # explicit cleanup by job id keeps its existing semantics
+    - name: explicitly clean up the job
+      async_status:
+        jid: "{{ fireforget.ansible_job_id }}"
+        mode: cleanup
+      register: cleaned
+
+    - assert:
+        that:
+          - cleaned.erased is defined

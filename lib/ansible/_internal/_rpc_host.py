@@ -150,8 +150,11 @@ class AsyncRPCOperation:
 class AutoRegisterRPC:
     """Base class for an RPC implementation which automatically registers its methods."""
 
+    _instance: t.ClassVar[t.Self]
+
     def __init_subclass__(cls, **kwargs):
         instance = cls()
+        cls._instance = instance
         LocalManager.register(cls.__name__, lambda: instance)
 
     @classmethod

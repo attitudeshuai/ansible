@@ -769,7 +769,22 @@ class TaskExecutor:
             cleanup_handler.cleanup(force=True)
             async_handler.cleanup(force=True)
 
+        self._settle_governed_job(async_jid)
+
         return async_utr
+
+    def _governance_target_host(self) -> str:
+        """Return the host name the async job runs on (the delegated host when delegating)."""
+        return self._task.delegate_to or self._host.name
+
+    def _settle_governed_job(self, jid: str) -> None:
+        """Drop bookkeeping for an async job after polling ended."""
+        from ansible.executor.async_governance import AsyncGovernanceRPC
+
+        try:
+            AsyncGovernanceRPC.get_client().settle_job(self._governance_target_host(), jid)
+        except Exception as ex:
+            display.warning(f"failed to settle async job {jid} in the governance tracker: {to_text(ex)}")
 
     def _get_become(self, name):
         become = become_loader.get(name)

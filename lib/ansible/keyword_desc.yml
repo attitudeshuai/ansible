@@ -3,6 +3,12 @@ args: "A secondary way to add arguments into a task. Takes a dictionary in which
 always: List of tasks, in a block, that execute no matter if there is an error in the block or not.
 any_errors_fatal: Force any un-handled task errors on any host to propagate to all hosts and end the play.
 async: Run a task asynchronously if the C(action) supports this; the value is the maximum runtime in seconds.
+async_count_internal: Whether async jobs launched internally by the framework count toward async_max_jobs; internal jobs are never blocked by the limit.
+async_governance: Enable async job lifecycle governance; default off. Enables async_max_jobs quotas, async_job_ttl reclamation and orphaned job handling.
+async_job_ttl: Time in seconds that finished async job status and result files are retained before automatic reclamation; 0 disables reclamation. Running jobs are never reclaimed.
+async_max_jobs: Maximum number of async jobs allowed to run concurrently per host; 0 means unlimited. Exceeding submissions wait or are rejected per async_overflow_policy.
+async_orphan_policy: How to handle jobs abandoned by a previous run (remote process gone while the status file says unfinished); choices are warn, reclaim and fail.
+async_overflow_policy: What to do when an async job submission exceeds async_max_jobs; wait for a slot or reject the submission before it starts.
 become: Boolean that controls if privilege escalation is used or not on :term:`Task` execution. Implemented by the become plugin. See :ref:`become_plugins`.
 become_exe: Path to the executable used to elevate privileges. Implemented by the become plugin. See :ref:`become_plugins`.
 become_flags: A string of flag(s) to pass to the privilege escalation program when :term:`become` is True.

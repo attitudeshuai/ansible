@@ -14,6 +14,7 @@ import secrets
 import shlex
 import stat
 import tempfile
+import time
 import typing as t
 
 from abc import ABC, abstractmethod
@@ -1101,6 +1102,7 @@ class ActionBase(ABC, _AnsiblePluginInfoMixin):
         delete_remote_tmp: bool | None = None,
         wrap_async: bool = False,
         ignore_unknown_opts: bool = False,
+        _governance_internal: bool = False,
     ) -> dict[str, object]:
         """
         Transfer and run a module along with its arguments.
@@ -1142,6 +1144,12 @@ class ActionBase(ABC, _AnsiblePluginInfoMixin):
             module_args = self._task.args
 
         self._update_module_args(module_name, module_args, task_vars, ignore_unknown_opts=ignore_unknown_opts)
+
+        if wrap_async:
+            governed_result = self._govern_async_launch(task_vars, _governance_internal)
+            if governed_result is not None:
+                # rejected or blocked; the target module was not transferred and left no status file
+                return governed_result
 
         remove_async_dir = None
         if wrap_async or self._task.async_val:
@@ -1314,12 +1322,117 @@ class ActionBase(ABC, _AnsiblePluginInfoMixin):
             # RPFIX-9: FUTURE: for backward compat (pre-RP), figure out if still makes sense
             utr.changed = True
 
+            if not utr.failed and utr.async_job_id:
+                self._register_governed_job(utr.async_job_id, _governance_internal, task_vars)
+
         # propagate interpreter discovery results back to the controller
         if self._discovered_interpreter_key:
             utr.set_fact(self._discovered_interpreter_key, self._discovered_interpreter)
 
         display.debug("done with _execute_module (%s, %s)" % (module_name, module_args))
         return utr.as_result_dict(for_round_trip=True)
+
+    def _governance_target_host(self, task_vars: dict[str, object]) -> str:
+        """Return the target host name the async job runs on."""
+        return self._task.delegate_to or str(task_vars['inventory_hostname'])
+
+    @staticmethod
+    def _get_play_for_task(task):
+        """Walk the task's parent chain to find the play it belongs to."""
+        obj = task
+        while obj is not None:
+            play = getattr(obj, '_play', None)
+            if play is not None:
+                return play
+            obj = getattr(obj, '_parent', None)
+
+        return None
+
+    def _run_async_governance_enforcement(self, task_vars: dict[str, object], host_config, submitted_jids: set[str]) -> dict[str, object]:
+        """Run the governance module in enforce mode on the target and return its result."""
+        async_dir = self.get_shell_option('async_dir', default="~/.ansible_async")
+        expanded_async_dir = self._remote_expand_user(async_dir)
+
+        result = self._execute_module(
+            module_name='ansible.legacy.async_governance',
+            module_args={
+                'mode': 'enforce',
+                'job_ttl': host_config.job_ttl,
+                'orphan_policy': host_config.orphan_policy,
+                'submitted_jids': sorted(submitted_jids),
+                '_async_dir': expanded_async_dir,
+            },
+            task_vars=task_vars,
+            wrap_async=False,
+        )
+
+        return result
+
+    def _govern_async_launch(self, task_vars: dict[str, object], internal: bool):
+        """Apply governance before an async launch.
+
+        Returns None when the launch may proceed, otherwise a synthetic result dict to return
+        in place of launching the target module.
+        """
+        from ansible.executor.async_governance import AsyncGovernanceRPC, resolve_host_config
+
+        play = self._get_play_for_task(self._task)
+        if play is None or not play.async_governance:
+            # fast path: governance disabled, existing behavior with no extra I/O
+            return None
+
+        try:
+            host_config = resolve_host_config(play, task_vars)
+        except ValueError as ex:
+            return {'failed': True, 'msg': f"Invalid async governance setting: {ex}"}
+
+        target_host = self._governance_target_host(task_vars)
+        tracker = AsyncGovernanceRPC.get_client()
+
+        while True:
+            submitted_jids = set(tracker.get_pending_jids(target_host))
+            gov_result = self._run_async_governance_enforcement(task_vars, host_config, submitted_jids)
+            gov_result.update(tracker.record_enforcement(target_host, gov_result))
+
+            if gov_result.get('failed') and not gov_result.get('async_failed_orphans'):
+                # target-side governance failure, e.g. the async job directory is missing or not writable
+                return gov_result
+
+            if not internal and (failed_orphans := gov_result.get('async_failed_orphans')):
+                orphan_jids = ', '.join(entry['jid'] for entry in failed_orphans)
+                return {
+                    'failed': True,
+                    'msg': f"async jobs abandoned by a previous run were found and async_orphan_policy is fail: {orphan_jids}",
+                    'async_orphaned_jobs': failed_orphans,
+                }
+
+            if not internal and gov_result.get('async_quota_full'):
+                running_count = gov_result.get('running_count', 0)
+                if host_config.overflow_policy == 'reject':
+                    return {
+                        'failed': True,
+                        'msg': f"async job submission rejected: host {target_host} already has {running_count} "
+                               f"running async job(s), limit {host_config.max_jobs}",
+                        'async_rejected': True,
+                        'async_max_jobs': host_config.max_jobs,
+                        'running_count': running_count,
+                    }
+
+                # wait for a running job to free a slot, then enforce again
+                time.sleep(C.ASYNC_GOVERNANCE_WAIT_INTERVAL)
+                continue
+
+            return None
+
+    def _register_governed_job(self, jid: str, internal: bool, task_vars: dict[str, object]) -> None:
+        """Record a launched async job so it counts toward the host quota immediately."""
+        from ansible.executor.async_governance import AsyncGovernanceRPC
+
+        try:
+            AsyncGovernanceRPC.get_client().register_job(self._governance_target_host(task_vars), jid, internal)
+        except Exception as ex:
+            # the job is already launched remotely; tracker problems must not fail it
+            display.warning(f"failed to record async job {jid} in the governance tracker: {to_text(ex)}")
 
     def _parse_returned_data(self, res: LowLevelExecuteCommandResult, profile: str) -> _task.UnifiedTaskResult:
         try:

@@ -1,0 +1,46 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  async_max_jobs: 1
+  async_overflow_policy: wait
+  tasks:
+    - block:
+        - name: short first job
+          command: sleep 2
+          async: 5
+          poll: 0
+          register: first
+
+        - name: second submission waits for the first job to free a slot
+          command: sleep 1
+          async: 5
+          poll: 0
+          register: second
+
+        - assert:
+            that:
+              - second is success
+              - second is changed
+              - second.ansible_job_id is defined
+
+        # wait for both jobs to actually finish, so cleanup does not race their final result write
+        - name: wait for the second job to finish
+          async_status:
+            jid: "{{ second.ansible_job_id }}"
+          register: second_done
+          until: second_done.finished
+          retries: 10
+          delay: 1
+      always:
+        - name: clean up first job
+          async_status:
+            jid: "{{ first.ansible_job_id }}"
+            mode: cleanup
+          when: first is defined and first.ansible_job_id is defined
+
+        - name: clean up second job
+          async_status:
+            jid: "{{ second.ansible_job_id }}"
+            mode: cleanup
+          when: second is defined and second.ansible_job_id is defined

@@ -14,11 +14,13 @@ class ForkSafeLock:
     def __init__(self) -> None:
         self._lock = _threading.Lock()
         self._acquired_before_fork = False
-        _os.register_at_fork(
-            before=self._before_fork,
-            after_in_parent=self._after_fork,
-            after_in_child=self._after_fork,
-        )
+        if hasattr(_os, 'register_at_fork'):
+            # fork is not supported on Windows, so the at-fork hooks are unnecessary there
+            _os.register_at_fork(
+                before=self._before_fork,
+                after_in_parent=self._after_fork,
+                after_in_child=self._after_fork,
+            )
 
     def _before_fork(self) -> None:
         self._acquired_before_fork = self._lock.acquire(timeout=_FORK_LOCK_TIMEOUT)

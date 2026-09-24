@@ -1,0 +1,17 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  tasks:
+    - name: query a host without any jobs
+      async_governance:
+        mode: query
+      register: q
+
+    - assert:
+        that:
+          - q.governance_enabled
+          - q.running_count == 0
+          - q.running_jobs == []
+          - q.orphaned_jobs == []
+          - q.last_reclamation is none

@@ -36,6 +36,7 @@ from ansible.errors import AnsibleError, ExitCode, AnsibleCallbackError
 from ansible._internal._errors._handler import ErrorHandler
 from ansible._internal import _rpc_host
 from ansible.executor.play_iterator import PlayIterator
+from ansible.executor.async_governance import AsyncGovernanceRPC, GovernanceConfig, validate_play_governance
 from ansible.executor.stats import AggregateStats
 from ansible.executor.task_result import CallbackTaskResult
 from ansible.inventory.manager import InventoryManager
@@ -383,6 +384,10 @@ class TaskQueueManager:
         new_play = play.copy()
         new_play.post_validate(templar)
         new_play.handlers = new_play.compile_roles_handlers() + new_play.handlers
+
+        # validate governance settings (including per-host overrides) and reset the tracker before anything runs
+        validate_play_governance(new_play, self._inventory, self._variable_manager)
+        AsyncGovernanceRPC.get_instance().configure(GovernanceConfig.from_play(new_play))
 
         self.hostvars = HostVars(
             inventory=self._inventory,

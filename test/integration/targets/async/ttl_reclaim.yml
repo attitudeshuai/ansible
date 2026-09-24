@@ -1,0 +1,58 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  async_job_ttl: 1
+  tasks:
+    - block:
+        - name: write a finished job file
+          copy:
+            dest: "{{ ansible_async_dir }}/jold.99999"
+            content: '{"rc": 0}'
+
+        - name: make the finished file older than the ttl
+          file:
+            path: "{{ ansible_async_dir }}/jold.99999"
+            modification_time: "200001010000.00"
+
+        - name: submit a still-running job (its enforcement reclaims the old finished file)
+          command: sleep 30
+          async: 30
+          poll: 0
+          register: running_job
+
+        - name: check old finished file was reclaimed
+          stat:
+            path: "{{ ansible_async_dir }}/jold.99999"
+          register: oldstat
+
+        - assert:
+            that:
+              - not oldstat.stat.exists
+
+        - name: running job is still present even though it is older than the ttl
+          stat:
+            path: "{{ ansible_async_dir }}/{{ running_job.ansible_job_id }}"
+          register: runstat
+
+        - assert:
+            that:
+              - runstat.stat.exists
+
+        - name: query shows the running job and the recorded reclamation
+          async_governance:
+            mode: query
+          register: q
+
+        - assert:
+            that:
+              - q.running_count == 1
+              - q.last_reclamation is not none
+              - q.last_reclamation.reclaimed_count == 1
+              - q.last_reclamation.reclaimed_jobs[0].reason == 'ttl_expired'
+      always:
+        - name: clean up the running job
+          async_status:
+            jid: "{{ running_job.ansible_job_id }}"
+            mode: cleanup
+          when: running_job is defined and running_job.ansible_job_id is defined

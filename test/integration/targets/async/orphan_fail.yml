@@ -1,0 +1,40 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  async_orphan_policy: fail
+  tasks:
+    - block:
+        - name: write a job file abandoned by a previous run
+          copy:
+            dest: "{{ ansible_async_dir }}/jorph.99999"
+          content: '{"started": true, "finished": false, "ansible_job_id": "jorph.99999"}'
+
+        - name: submission must be reported as failed due to the abandoned job
+          command: true
+          async: 10
+          poll: 0
+          register: blocked
+          ignore_errors: true
+
+        - assert:
+            that:
+              - blocked is failed
+              - blocked.async_orphaned_jobs | length == 1
+              - blocked.async_orphaned_jobs[0].jid == 'jorph.99999'
+              - blocked.ansible_job_id is not defined
+
+        # the blocked submission created no new job file
+        - name: list job files
+          find:
+            paths: "{{ ansible_async_dir }}"
+          register: found
+
+        - assert:
+            that:
+              - found.files | length == 1
+      always:
+        - name: clean up the abandoned file
+          file:
+            path: "{{ ansible_async_dir }}/jorph.99999"
+            state: absent

@@ -1,0 +1,9 @@
+---
+- hosts: localhosts
+  gather_facts: false
+  async_governance: true
+  async_max_jobs: -1
+  tasks:
+    - name: never reached
+      debug:
+        msg: play start must fail before this runs
