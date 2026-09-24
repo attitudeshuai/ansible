@@ -19,6 +19,9 @@ class PluginInterposer(ObjectProxy):
     def get(self, key: str) -> dict[str, object]:
         return self._decode(self.__wrapped__.get(self._get_key(key)))
 
+    def get_fact_record(self, key: str) -> dict[str, object]:
+        return self._decode(self.__wrapped__.get_fact_record(self._get_key(key)))
+
     def set(self, key: str, value: dict[str, object]) -> None:
         self.__wrapped__.set(self._get_key(key), self._encode(value))
 

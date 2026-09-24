@@ -1,0 +1,14 @@
+minor_changes:
+  - |
+    Fact cache - added gather-level provenance and per-subset time-to-live. With the new
+    ``FACT_CACHE_SUBSET_TTL`` configuration, facts are recorded per gather subset (gather batch,
+    successful gather time, gather entry and source fact module) and freshness checks, re-gathering
+    and invalidation happen per subset; one expiring subset no longer forces re-gathering the other
+    subsets of the host.
+  - |
+    Fact cache - added ``FACT_CACHE_UNAVAILABLE_POLICY`` (``fail`` by default, or ``stale``)
+    controlling whether an expired subset whose re-gather fails is served from the cached value
+    (marked with the subset and how long it has been expired) or fails the gather task.
+  - fact cache plugins can now implement the optional ``get_fact_record`` interface (``_supports_fact_subsets`` capability); the builtin ``jsonfile`` and ``memory`` plugins support it, while third party plugins keep the previous whole-record behavior with a one-time warning.
+  - Added the ``ansible.builtin.fact_cache`` controller action to query fact/subset provenance and invalidate subsets or host records from tasks.
+  - Added the ``ansible-facts`` command with ``list`` and ``invalidate`` subcommands to inspect subset freshness and invalidate records from the controller without connecting to targets.

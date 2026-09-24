@@ -36,6 +36,11 @@ from ansible.module_utils.facts import timeout
 from ansible.module_utils.facts import collector
 from ansible.module_utils.common.collections import is_string
 
+# Internal channel reporting which fact keys each collector actually produced during this run.
+# Kept in sync with ansible.vars.fact_subsets.COLLECTOR_FACTS_KEY; values are stripped before
+# facts reach user variables or the persistent cache.
+COLLECTOR_FACTS_KEY = '_ansible_collector_facts'
+
 
 class AnsibleFactCollector(collector.BaseFactCollector):
     """A FactCollector that returns results under 'ansible_facts' top level key.
@@ -77,6 +82,8 @@ class AnsibleFactCollector(collector.BaseFactCollector):
         collected_facts = collected_facts or {}
 
         facts_dict = {}
+        # controller-side gather provenance: list of {collector name, fact keys produced}
+        collector_facts = []
 
         for collector_obj in self.collectors:
             info_dict = {}
@@ -95,7 +102,18 @@ class AnsibleFactCollector(collector.BaseFactCollector):
             collected_facts.update(info_dict.copy())
 
             # NOTE: If we want complicated fact dict merging, this is where it would hook in
-            facts_dict.update(self._filter(info_dict, self.filter_spec))
+            filtered = self._filter(info_dict, self.filter_spec)
+            if isinstance(filtered, dict):
+                filtered_items = list(filtered.items())
+            else:
+                filtered_items = list(filtered)
+            facts_dict.update(filtered_items)
+
+            collector_name = getattr(collector_obj, 'name', None)
+            if collector_name and collector_name != 'gather_subset':
+                collector_facts.append({'collector': collector_name, 'keys': [key for key, _value in filtered_items]})
+
+        facts_dict[COLLECTOR_FACTS_KEY] = collector_facts
 
         return facts_dict
 

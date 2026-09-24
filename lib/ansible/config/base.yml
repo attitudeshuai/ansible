@@ -291,6 +291,46 @@ CACHE_PLUGIN_TIMEOUT:
   - {key: fact_caching_timeout, section: defaults}
   type: integer
   yaml: {key: facts.cache.timeout}
+FACT_CACHE_SUBSET_TTL:
+  name: Fact Cache per-subset time-to-live
+  default: {}
+  description:
+    - Maps fact gather subset names (for example V(hardware), V(network), V(virtual), V(local), V(mounts))
+      or fact module FQCNs (for modules listed in FACTS_MODULES, for example V(ansible.builtin.package_facts))
+      to their time-to-live in seconds.
+    - "When empty (the default), the fact cache behaves exactly as without this option; the whole host
+      record is stored and expired based on CACHE_PLUGIN_TIMEOUT."
+    - When set, freshness checks, re-gathering and invalidation happen per subset; expiring one subset
+      does not invalidate the other subsets of the same host.
+    - "CACHE_PLUGIN_TIMEOUT still applies to the whole host record as a backstop: once a record is older
+      than it, the next implicit play gather re-gathers facts even if every declared subset is fresh."
+    - A TTL of V(0) means a subset never expires on its own (the whole record backstop still applies);
+      the key V(all) is not allowed (use CACHE_PLUGIN_TIMEOUT for the whole record).
+    - "The value is a mapping; when provided via environment variable or ini entry it can be expressed as
+      JSON/YAML (for example a mapping of hardware to 86400) or as a comma separated list of name/seconds pairs."
+  env: [{name: ANSIBLE_FACT_CACHE_SUBSET_TTL}]
+  ini:
+  - {key: fact_cache_subset_ttl, section: defaults}
+  type: raw
+  yaml: {key: facts.cache.subset_ttl}
+  version_added: "2.22"
+FACT_CACHE_UNAVAILABLE_POLICY:
+  name: Fact cache unavailable subset policy
+  default: fail
+  description:
+    - Controls what happens when a fact subset with an expired TTL has to be re-gathered but gathering
+      is unavailable (unreachable host or failed fact module).
+    - V(fail) fails the gather task with an explicit error and does not record the failed subset as a
+      successful gather; successfully gathered subsets of the same run are still written.
+    - V(stale) keeps using the expired subset values, marks the subset (and how long it has been expired)
+      in the gather result and continues the task; when no previous value exists the gather still fails.
+  env: [{name: ANSIBLE_FACT_CACHE_UNAVAILABLE_POLICY}]
+  ini:
+  - {key: fact_cache_unavailable_policy, section: defaults}
+  type: string
+  choices: [fail, stale]
+  yaml: {key: facts.cache.unavailable_policy}
+  version_added: "2.22"
 COLLECTIONS_SCAN_SYS_PATH:
   name: Scan PYTHONPATH for installed collections
   description: A boolean to enable or disable scanning the sys.path for installed collections.

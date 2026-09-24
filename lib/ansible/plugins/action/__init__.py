@@ -99,6 +99,9 @@ class ActionBase(ABC, _AnsiblePluginInfoMixin):
         from ansible.plugins import loader as plugin_loaders  # avoid circular global import since PluginLoader needs ActionBase
 
         self._shared_loader_obj = plugin_loaders  # shared_loader_obj was just a ref to `ansible.plugins.loader` anyway; this lets us inherit its type
+        # Set by TaskExecutor after instantiation; None for actions created outside of task execution.
+        # Used by controller-side actions that manage the fact cache (gather_facts, ansible.builtin.fact_cache).
+        self._variable_manager = None
         self._cleanup_remote_tmp = False
 
         # interpreter discovery state

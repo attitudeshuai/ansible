@@ -48,6 +48,9 @@ class BaseCacheModule(AnsiblePlugin):
     _persistent = True
     """Plugins that do not persist data between runs can set False to bypass schema-version key munging and JSON serialization wrapper."""
 
+    _supports_fact_subsets = False
+    """Plugins that implement per-subset fact cache provenance set this True and provide get_fact_record()."""
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
 
@@ -56,6 +59,18 @@ class BaseCacheModule(AnsiblePlugin):
     @abstractmethod
     def get(self, key: str) -> dict[str, object]:
         pass
+
+    def get_fact_record(self, key: str) -> dict[str, object]:
+        """Return the host fact record bypassing the whole-record expiration check.
+
+        Unlike :meth:`get`, implementations must serve a record even when its whole-record TTL
+        (for example a backing file's mtime) has elapsed; per-subset freshness is then evaluated
+        by the caller using the gather metadata in the record. Corrupt/unreadable records are
+        handled the same way as in :meth:`get`.
+
+        Only plugins that set ``_supports_fact_subsets = True`` are expected to implement this.
+        """
+        raise NotImplementedError(f"Cache plugin {type(self).__name__!r} does not support per-subset fact records.")
 
     @abstractmethod
     def set(self, key: str, value: dict[str, object]) -> None:
@@ -82,6 +97,8 @@ class BaseFileCacheModule(BaseCacheModule):
     """
     A caching module backed by file based storage.
     """
+    _supports_fact_subsets = True
+
     def __init__(self, *args, **kwargs):
 
         try:
@@ -142,6 +159,24 @@ class BaseFileCacheModule(BaseCacheModule):
             self._files[key] = os.path.join(self._cache_dir, prefix + safe)
         return self._files[key]
 
+    def _read_cache_file(self, key):
+        """Load a host record from disk, applying the same corrupt/missing handling as get()."""
+        cachefile = self._get_cache_file_name(key)
+        try:
+            return self._load(cachefile)
+        except ValueError as e:
+            display.warning("error in '%s' cache plugin while trying to read %s : %s. "
+                            "Most likely a corrupt file, so erasing and failing." % (self.plugin_name, cachefile, to_bytes(e)))
+            self.delete(key)
+            raise AnsibleError("The cache file %s was corrupt, or did not otherwise contain valid data. "
+                               "It has been removed, so you can re-run your command now." % cachefile)
+        except FileNotFoundError:
+            raise KeyError
+        except AnsibleError:
+            raise
+        except Exception as ex:
+            raise AnsibleError(f"Error while accessing the cache file {cachefile!r}.") from ex
+
     def get(self, key):
         """ This checks the in memory cache first as the fact was not expired at 'gather time'
         and it would be problematic if the key did expire after some long running tasks and
@@ -152,22 +187,19 @@ class BaseFileCacheModule(BaseCacheModule):
             if self.has_expired(key) or key == "":
                 raise KeyError
 
-            cachefile = self._get_cache_file_name(key)
-            try:
-                value = self._load(cachefile)
-                self._cache[key] = value
-            except ValueError as e:
-                display.warning("error in '%s' cache plugin while trying to read %s : %s. "
-                                "Most likely a corrupt file, so erasing and failing." % (self.plugin_name, cachefile, to_bytes(e)))
-                self.delete(key)
-                raise AnsibleError("The cache file %s was corrupt, or did not otherwise contain valid data. "
-                                   "It has been removed, so you can re-run your command now." % cachefile)
-            except FileNotFoundError:
-                raise KeyError
-            except Exception as ex:
-                raise AnsibleError(f"Error while accessing the cache file {cachefile!r}.") from ex
+            self._cache[key] = self._read_cache_file(key)
 
         return self._cache.get(key)
+
+    def get_fact_record(self, key):
+        """Return the host record ignoring whole-record mtime expiry (per-subset TTL governs instead)."""
+        if key == "":
+            raise KeyError
+
+        if key not in self._cache:
+            self._cache[key] = self._read_cache_file(key)
+
+        return self._cache[key]
 
     def set(self, key, value):
 

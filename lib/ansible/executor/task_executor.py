@@ -40,6 +40,7 @@ from ansible.template import Templar
 from ansible.utils.collection_loader import AnsibleCollectionConfig
 from ansible.utils.display import Display
 from ansible.utils.vars import combine_vars
+from ansible.vars import fact_subsets
 from ansible.vars.clean import namespace_facts
 from ansible.vars.manager import _clean_and_deprecate_top_level_facts, _INJECT_FACTS
 from ansible._internal._errors import _task_timeout
@@ -512,6 +513,7 @@ class TaskExecutor:
 
         # get handler
         self._handler, _module_context = self._get_action_handler_with_module_context(templar=task_ctx.task_templar)
+        self._handler._variable_manager = self._variable_manager
 
         # self._connection should have its final value for this task/loop-item by this point; record on the task object
         self._update_task_connection()
@@ -553,9 +555,24 @@ class TaskExecutor:
                     else:
                         self._final_q.send_callback('v2_runner_on_async_ok', self._host, self._task, utr)
 
-            if utr.ansible_facts and _task.VariableLayer.CACHEABLE_FACT not in utr.pending_changes.register_host_variables:
+            # The cache layer may carry the collector attribution channel so the variable manager can
+            # record subset provenance; user facing variables/registered results must never see it.
+            raw_facts = utr.ansible_facts
+            if utr.ansible_facts:
+                leaked = [key for key in utr.ansible_facts
+                          if key in (fact_subsets.COLLECTOR_FACTS_KEY, fact_subsets.META_KEY)]
+                if leaked:
+                    clean_facts = {key: value for key, value in utr.ansible_facts.items() if key not in leaked}
+                    utr.ansible_facts = clean_facts
+                else:
+                    raw_facts = clean_facts = utr.ansible_facts
+            else:
+                clean_facts = utr.ansible_facts
+
+            if raw_facts and _task.VariableLayer.CACHEABLE_FACT not in utr.pending_changes.register_host_variables:
                 # For backward compatibility, if the action provided ansible_facts, use that as the CACHEABLE_FACT layer if the action did not provide one.
-                utr.pending_changes.register_host_variables[_task.VariableLayer.CACHEABLE_FACT] = utr.ansible_facts
+                # The raw layer (including any provenance channel) is consumed/filtered by set_host_facts.
+                utr.pending_changes.register_host_variables[_task.VariableLayer.CACHEABLE_FACT] = raw_facts
 
             # Variable layers should be reflected on task vars in the same way they will be handled by variable manager.
             # What occurs below is a partial re-implementation of variable manager, and thus does not fully reflect its behavior.
@@ -563,15 +580,19 @@ class TaskExecutor:
 
             if not self._task.delegate_to or not self._task.delegate_facts:
                 if cacheable_fact_layer := utr.pending_changes.register_host_variables.get(_task.VariableLayer.CACHEABLE_FACT):
+                    visible_fact_layer = {
+                        key: value for key, value in cacheable_fact_layer.items()
+                        if key not in (fact_subsets.COLLECTOR_FACTS_KEY, fact_subsets.META_KEY)
+                    }
                     task_ctx.update_task_vars(dict(
                         ansible_facts=combine_vars(
                             task_ctx.task_vars.get('ansible_facts', {}),
-                            namespace_facts(cacheable_fact_layer)['ansible_facts'],
+                            namespace_facts(visible_fact_layer)['ansible_facts'],
                         ),
                     ))
 
                     if _INJECT_FACTS:
-                        task_ctx.update_task_vars(_clean_and_deprecate_top_level_facts(cacheable_fact_layer))
+                        task_ctx.update_task_vars(_clean_and_deprecate_top_level_facts(visible_fact_layer))
 
                 if include_vars_layer := utr.pending_changes.register_host_variables.get(_task.VariableLayer.INCLUDE_VARS):
                     task_ctx.update_task_vars(include_vars_layer)
@@ -615,10 +636,10 @@ class TaskExecutor:
                 if attempt < retries:
                     utr.retries = retries
                     utr.attempts = attempt + 1
-                    display.debug('Retrying task, attempt %d of %d' % (attempt, retries))
                     self._final_q.send_callback('v2_runner_retry', self._host, self._task, utr)
                     time.sleep(delay)
                     self._handler = self._get_action_handler(templar=task_ctx.task_templar)
+                    self._handler._variable_manager = self._variable_manager
         else:
             if retries > 1:
                 # we ran out of attempts, so mark the result as failed

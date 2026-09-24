@@ -156,6 +156,8 @@ class PlayIterator:
         setup_task.action = 'gather_facts'
         setup_task.name = 'Gathering Facts'
         setup_task.args = {}
+        # internal marker used by the gather action to tell implicit play gathering from explicit tasks
+        setup_task._implicit_gather = True
 
         # Unless play is specifically tagged, gathering should 'always' run
         if not self._play.tags:
@@ -301,7 +303,7 @@ class PlayIterator:
                 if gather_facts and (
                     (gathering == 'implicit' and implied) or
                     (gathering == 'explicit' and boolean(self._play.gather_facts, strict=False)) or
-                    (gathering == 'smart' and implied and not self._variable_manager._facts_gathered_for_host(host.name))
+                    (gathering == 'smart' and implied and not self._variable_manager.facts_fresh_for_host(host.name))
                 ):
                     task = self._blocks[0].block[0]
 

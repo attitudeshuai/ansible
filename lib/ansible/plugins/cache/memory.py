@@ -21,6 +21,7 @@ from ansible.plugins.cache import BaseCacheModule
 
 class CacheModule(BaseCacheModule):
     _persistent = False  # prevent unnecessary JSON serialization and key munging
+    _supports_fact_subsets = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -28,6 +29,9 @@ class CacheModule(BaseCacheModule):
         self._cache = {}
 
     def get(self, key):
+        return self._cache[key]
+
+    def get_fact_record(self, key):
         return self._cache[key]
 
     def set(self, key, value):

@@ -37,6 +37,7 @@ from ansible._internal._templating._engine import TemplateEngine
 from ansible.plugins.loader import cache_loader
 from ansible.utils.display import Display
 from ansible.utils.vars import combine_vars, load_extra_vars, load_options_vars
+from ansible.vars import fact_subsets
 from ansible.vars.clean import namespace_facts, clean_facts
 from ansible.vars.hostvars import HostVars
 from ansible.vars.plugins import get_vars_from_inventory_sources, get_vars_from_path
@@ -146,6 +147,9 @@ class VariableManager:
             # fallback to builtin memory cache plugin
             display.error_as_warning(None, ex)
             self._fact_cache = cache_loader.get('ansible.builtin.memory')  # use FQCN to ensure the builtin version is used
+
+        # resolved per-subset TTL policy, memoized on first use (None means not yet resolved)
+        self._fact_subset_policy: tuple[dict[str, int], str] | None = None
 
     @property
     def extra_vars(self):
@@ -300,10 +304,12 @@ class VariableManager:
 
             # finally, the facts caches for this host, if they exist
             try:
-                try:
-                    facts = self._fact_cache.get(host.name)
-                except KeyError:
-                    facts = {}
+                facts = self._get_host_fact_record(host.name)
+
+                # gather provenance/internal channels are controller bookkeeping, never user facts
+                if fact_subsets.META_KEY in facts or fact_subsets.COLLECTOR_FACTS_KEY in facts:
+                    facts = {k: v for k, v in facts.items()
+                             if k not in (fact_subsets.META_KEY, fact_subsets.COLLECTOR_FACTS_KEY)}
 
                 all_vars |= namespace_facts(facts)
 
@@ -445,6 +451,114 @@ class VariableManager:
 
         return bool(facts.get('_ansible_facts_gathered', False))
 
+    def _resolve_fact_subset_policy(self) -> tuple[dict[str, int], str]:
+        """Resolve and memoize the per-subset TTL map and unavailable-gather policy."""
+        if self._fact_subset_policy is not None:
+            return self._fact_subset_policy
+
+        warnings: list[str] = []
+        raw_ttl = C.config.get_config_value('FACT_CACHE_SUBSET_TTL')
+        ttl_map, parse_warnings = fact_subsets.parse_subset_ttl(raw_ttl)
+        warnings.extend(parse_warnings)
+
+        if ttl_map and not getattr(self._fact_cache, '_supports_fact_subsets', False):
+            display.warning(
+                "Per-subset fact cache TTLs were configured but the fact cache plugin %s does not "
+                "support subset records; using whole-record cache behavior instead."
+                % type(self._fact_cache).__name__
+            )
+            ttl_map = {}
+        elif ttl_map:
+            valid_names = fact_subsets.validate_subset_names(list(ttl_map), warnings)
+            ttl_map = {name: ttl_map[name] for name in valid_names}
+
+        unavailable_policy = C.config.get_config_value('FACT_CACHE_UNAVAILABLE_POLICY') or fact_subsets.POLICY_FAIL
+        if unavailable_policy not in (fact_subsets.POLICY_FAIL, fact_subsets.POLICY_STALE):
+            warnings.append(
+                f"Unknown fact cache unavailable policy {unavailable_policy!r}, using {fact_subsets.POLICY_FAIL!r}."
+            )
+            unavailable_policy = fact_subsets.POLICY_FAIL
+
+        for warning in warnings:
+            display.warning(warning)
+
+        self._fact_subset_policy = (ttl_map, unavailable_policy)
+        return self._fact_subset_policy
+
+    def fact_subsets_active(self) -> bool:
+        """True when non-empty subset TTLs are configured and the cache plugin supports them."""
+        return bool(self._resolve_fact_subset_policy()[0])
+
+    def _get_host_fact_record(self, hostname) -> dict:
+        """Return the host record, bypassing whole-record expiry when subset policies are active."""
+        if self.fact_subsets_active():
+            return self._fact_cache.get_fact_record(hostname)
+        return self._fact_cache.get(hostname)
+
+    def whole_record_expired(self, hostname) -> bool:
+        """True when the backing file/record is older than the whole-record cache timeout."""
+        if not C.CACHE_PLUGIN_TIMEOUT:
+            return False
+        has_expired = getattr(self._fact_cache, 'has_expired', None)
+        if not callable(has_expired):
+            return False
+        try:
+            return bool(has_expired(hostname))
+        except Exception:
+            return False
+
+    def facts_fresh_for_host(self, hostname) -> bool:
+        """Whether implicit fact gathering can be skipped for this host."""
+        ttl_map, dummy_policy = self._resolve_fact_subset_policy()
+        if not ttl_map:
+            return self._facts_gathered_for_host(hostname)
+
+        try:
+            record = self._fact_cache.get_fact_record(hostname)
+        except KeyError:
+            return False
+
+        if not record.get('_ansible_facts_gathered', False):
+            return False
+
+        # the whole-record timeout stays a backstop for undeclared/unmanaged facts once subset TTLs exist
+        if self.whole_record_expired(hostname):
+            return False
+
+        meta = fact_subsets.get_meta(record)
+        if meta is None:
+            # legacy record without gather provenance: gather once to (re)build it
+            return False
+
+        return not fact_subsets.stale_subsets(meta, ttl_map)
+
+    def get_fact_cache_status(self, hostname, fact=None, subsets=None):
+        """Stable per-host/per-subset/per-fact freshness structure (task side and CLI share this)."""
+        ttl_map, dummy_policy = self._resolve_fact_subset_policy()
+        try:
+            record = self._get_host_fact_record(hostname)
+        except KeyError:
+            record = None
+
+        return fact_subsets.build_status(
+            hostname, record, ttl_map=ttl_map if ttl_map else {}, fact=fact, subsets_filter=subsets,
+        )
+
+    def invalidate_facts(self, hostname, subset=None):
+        """Invalidate one subset (only its owned facts) or the whole host record (subset=None)."""
+        if subset is None:
+            self.clear_facts(hostname)
+            return
+
+        try:
+            record = self._get_host_fact_record(hostname)
+        except KeyError:
+            return
+
+        new_record = fact_subsets.invalidate(record, subset)
+        if new_record is not None:
+            self._fact_cache.set(hostname, new_record)
+
     def _get_magic_variables(self, play, host, task, include_hostvars, _hosts=None, _hosts_all=None):
         """
         Returns a dictionary of so-called "magic" variables in Ansible,
@@ -577,20 +691,73 @@ class VariableManager:
 
         warn_if_reserved(facts)
 
+        # Never let module data spoof gather provenance
+        if fact_subsets.META_KEY in facts:
+            facts = {key: value for key, value in facts.items() if key != fact_subsets.META_KEY}
+
+        # An explicit setup module result carrying the collector channel gets per-subset provenance,
+        # the same way gather_facts action results do (FR: explicit tasks update subset sources/times).
+        if self.fact_subsets_active() and fact_subsets.COLLECTOR_FACTS_KEY in facts:
+            self._set_setup_facts_with_provenance(host, dict(facts))
+            return
+
+        # The collector channel is controller bookkeeping, never a fact
+        facts = {key: value for key, value in facts.items() if key != fact_subsets.COLLECTOR_FACTS_KEY}
+
         try:
-            host_cache = self._fact_cache.get(host)
+            host_cache = self._get_host_fact_record(host)
         except KeyError:
             # We get to set this as new
-            host_cache = facts
+            host_cache = dict(facts)
         else:
             if not isinstance(host_cache, MutableMapping):
                 raise TypeError('The object retrieved for {0} must be a MutableMapping but was'
                                 ' a {1}'.format(host, type(host_cache)))
-            # Update the existing facts
+            # Update the existing facts (gather provenance, if any, is preserved)
             host_cache |= facts
 
         # Save the facts back to the backing store
         self._fact_cache.set(host, host_cache)
+
+    def _set_setup_facts_with_provenance(self, host: str, facts: dict) -> None:
+        """Attribute an explicit setup module result to declared gather subsets and persist provenance."""
+        ttl_map, dummy_policy = self._resolve_fact_subset_policy()
+        collector_facts = facts.pop(fact_subsets.COLLECTOR_FACTS_KEY, None)
+        terms = [term for term in ttl_map if '.' not in term]
+
+        try:
+            existing = self._get_host_fact_record(host)
+        except KeyError:
+            existing = {}
+
+        system = facts.get('ansible_system') or (existing.get('ansible_system') if isinstance(existing, Mapping) else None)
+        attribution, leftover = fact_subsets.attribute_collector_facts(collector_facts, terms, system)
+        owned = {key for keys in attribution.values() for key in keys}
+        extra = [key for key in facts
+                 if key not in owned and not key.startswith('_ansible_') and key not in ('gather_subset', 'module_setup')]
+        unmanaged = sorted(set(leftover) | set(extra))
+        if unmanaged:
+            attribution[fact_subsets.UNMANAGED_SUBSET] = unmanaged
+        attribution = {subset: keys for subset, keys in attribution.items() if keys}
+
+        record = fact_subsets.apply_gather(
+            existing, facts, attribution,
+            batch_id=fact_subsets.make_batch_id(), entry=fact_subsets.ENTRY_EXPLICIT,
+            source='ansible.builtin.setup', prune=False)
+        self._fact_cache.set(host, record)
+
+    def get_host_fact_record(self, hostname) -> dict:
+        """Raw host record (including gather metadata) for the gather action; empty dict when absent."""
+        try:
+            return self._get_host_fact_record(hostname)
+        except KeyError:
+            return {}
+
+    def save_host_fact_record(self, hostname, record) -> None:
+        """Persist a full host record prepared with gather provenance."""
+        if not isinstance(record, MutableMapping):
+            raise AnsibleAssertionError("the type of 'record' to save should be a MutableMapping but is a %s" % type(record))
+        self._fact_cache.set(hostname, record)
 
     def set_nonpersistent_facts(self, host, facts):
         """

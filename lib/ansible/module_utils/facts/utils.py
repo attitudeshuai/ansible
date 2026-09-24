@@ -15,8 +15,13 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
+
+try:
+    import fcntl
+except ImportError:
+    # fcntl is POSIX-only; the only use below is already optional (best effort non-blocking open)
+    fcntl = None
 
 
 def get_file_content(path, default=None, strip=True):
@@ -36,9 +41,10 @@ def get_file_content(path, default=None, strip=True):
             datafile = open(path)
             try:
                 # try to not enter kernel 'block' mode, which prevents timeouts
-                fd = datafile.fileno()
-                flag = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
+                if fcntl is not None:
+                    fd = datafile.fileno()
+                    flag = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
             except Exception:
                 pass  # not required to operate, but would have been nice!
 

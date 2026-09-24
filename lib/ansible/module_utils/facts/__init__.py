@@ -29,5 +29,10 @@
 from __future__ import annotations
 
 # import from the compat api because 2.0-2.3 had a module_utils.facts.ansible_facts
-# and get_all_facts in top level namespace
-from ansible.module_utils.facts.compat import ansible_facts, get_all_facts   # noqa
+# and get_all_facts in top level namespace. Some collectors pull in POSIX-only modules
+# (pwd, grp, fcntl, ...); tolerate their absence so controller-side code can still import
+# the platform independent fact submodules (collector selection, provenance) directly.
+try:
+    from ansible.module_utils.facts.compat import ansible_facts, get_all_facts  # noqa: F401
+except ImportError:
+    pass

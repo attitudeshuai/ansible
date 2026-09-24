@@ -175,6 +175,8 @@ class TestInPlace(unittest.TestCase):
 
         res = fact_collector.collect()
         self.assertIsInstance(res, dict)
+        # the collector provenance channel is bookkeeping, not a fact
+        res.pop(ansible_collector.COLLECTOR_FACTS_KEY, None)
         # just assert it's not almost empty
         self.assertLess(len(res), 3)
 
@@ -246,6 +248,7 @@ class TestCollectedFacts(unittest.TestCase):
         # FIXME: kluge for non-namespace fact
         facts.pop('module_setup', None)
         facts.pop('gather_subset', None)
+        facts.pop(ansible_collector.COLLECTOR_FACTS_KEY, None)
 
         for fact_key in facts:
             self.assertTrue(fact_key.startswith('ansible_'),
@@ -253,13 +256,13 @@ class TestCollectedFacts(unittest.TestCase):
 
     def _assert_expected_facts(self, facts):
 
-        facts_keys = sorted(facts.keys())
+        facts_keys = sorted(k for k in facts.keys() if k != ansible_collector.COLLECTOR_FACTS_KEY)
         for expected_fact in self.expected_facts:
             self.assertIn(expected_fact, facts_keys)
 
     def _assert_not_expected_facts(self, facts):
 
-        facts_keys = sorted(facts.keys())
+        facts_keys = sorted(k for k in facts.keys() if k != ansible_collector.COLLECTOR_FACTS_KEY)
         for not_expected_fact in self.not_expected_facts:
             self.assertNotIn(not_expected_fact, facts_keys)
 
@@ -408,6 +411,8 @@ class TestCollectorDepsWithFilter(unittest.TestCase):
                                                    filter_spec=_mock_module.params['filter'])
         facts_dict = fact_collector.collect(module=_mock_module,
                                             collected_facts=collected_facts)
+        # the collector provenance channel is controller bookkeeping, not a returned fact
+        facts_dict.pop(ansible_collector.COLLECTOR_FACTS_KEY, None)
         return facts_dict
 
 

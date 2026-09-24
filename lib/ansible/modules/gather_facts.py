@@ -60,7 +60,36 @@ author:
 """
 
 RETURN = """
-# depends on the fact module called
+fact_cache:
+  description: Per-subset gather summary (only present when FACT_CACHE_SUBSET_TTL is configured).
+  returned: when per-subset fact caching is enabled
+  type: dict
+  contains:
+    batch_id:
+      description: Identifier of this gather run; shared by every subset gathered in the run.
+      returned: always
+      type: str
+    refreshed:
+      description: Source fact modules whose subsets were written in this run.
+      returned: always
+      type: list
+      elements: str
+    fresh_skipped:
+      description: Fact modules not executed because all their subsets were within TTL.
+      returned: always
+      type: list
+      elements: str
+    served_stale:
+      description: Subsets served from expired cache because re-gathering failed under the stale unavailable policy.
+      returned: when applicable
+      type: list
+      elements: str
+stale_fact_subsets:
+  description: Expired subsets served from the cache (with batch, age and expired seconds) under the stale unavailable policy.
+  returned: when applicable
+  type: list
+  elements: dict
+# the gathered facts themselves depend on the fact module called
 """
 
 EXAMPLES = """
