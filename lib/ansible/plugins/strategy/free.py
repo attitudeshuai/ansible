@@ -150,46 +150,54 @@ class StrategyModule(StrategyBase):
                                 break
 
                         iterator.set_state_for_host(host.name, state)
+
+                        blocked_handler = False
                         if isinstance(task, Handler):
+                            blocked_by = iterator.handler_blocked_reason(host, task)
+                            if blocked_by is not None:
+                                # a dependency of this handler failed on the host; skip it instead of running it
+                                host_results.append(self._skip_blocked_handler(host, task, blocked_by))
+                                blocked_handler = True
                             task.remove_host(host)
 
-                        try:
-                            action = action_loader.get(task.action, class_only=True, collection_list=task.collections)
-                        except KeyError:
-                            # we don't care here, because the action may simply not have a
-                            # corresponding action plugin
-                            action = None
+                        if not blocked_handler:
+                            try:
+                                action = action_loader.get(task.action, class_only=True, collection_list=task.collections)
+                            except KeyError:
+                                # we don't care here, because the action may simply not have a
+                                # corresponding action plugin
+                                action = None
 
-                        task.post_validate_attribute("name", templar=templar)
+                            task.post_validate_attribute("name", templar=templar)
 
-                        run_once = templar.template(task.run_once) or action and getattr(action, 'BYPASS_HOST_LOOP', False)
-                        if run_once:
-                            if action and getattr(action, 'BYPASS_HOST_LOOP', False):
-                                raise AnsibleError("The '%s' module bypasses the host loop, which is currently not supported in the free strategy "
-                                                   "and would instead execute for every host in the inventory list." % task.action, obj=task._ds)
-                            else:
-                                display.warning("Using run_once with the free strategy is not currently supported. This task will still be "
-                                                "executed for every host in the inventory list.")
-
-                        if task.action in C._ACTION_META:
-                            if self._host_pinned:
-                                meta_task_dummy_results_count += 1
-                                workers_free -= 1
-                            self._execute_meta(task, play_context, iterator, target_host=host)
-                        else:
-                            # handle step if needed, skip meta actions as they are used internally
-                            if not self._step or self._take_step(task, host_name):
-                                if task.any_errors_fatal:
-                                    display.warning("Using any_errors_fatal with the free strategy is not supported, "
-                                                    "as tasks are executed independently on each host")
-                                if isinstance(task, Handler):
-                                    self._tqm.send_callback('v2_playbook_on_handler_task_start', task)
+                            run_once = templar.template(task.run_once) or action and getattr(action, 'BYPASS_HOST_LOOP', False)
+                            if run_once:
+                                if action and getattr(action, 'BYPASS_HOST_LOOP', False):
+                                    raise AnsibleError("The '%s' module bypasses the host loop, which is currently not supported in the free strategy "
+                                                       "and would instead execute for every host in the inventory list." % task.action, obj=task._ds)
                                 else:
-                                    self._tqm.send_callback('v2_playbook_on_task_start', task, is_conditional=False)
-                                self._queue_task(host, task, task_vars, play_context)
-                                # each task is counted as a worker being busy
-                                workers_free -= 1
-                                del task_vars
+                                    display.warning("Using run_once with the free strategy is not currently supported. This task will still be "
+                                                    "executed for every host in the inventory list.")
+
+                            if task.action in C._ACTION_META:
+                                if self._host_pinned:
+                                    meta_task_dummy_results_count += 1
+                                    workers_free -= 1
+                                self._execute_meta(task, play_context, iterator, target_host=host)
+                            else:
+                                # handle step if needed, skip meta actions as they are used internally
+                                if not self._step or self._take_step(task, host_name):
+                                    if task.any_errors_fatal:
+                                        display.warning("Using any_errors_fatal with the free strategy is not supported, "
+                                                        "as tasks are executed independently on each host")
+                                    if isinstance(task, Handler):
+                                        self._tqm.send_callback('v2_playbook_on_handler_task_start', task)
+                                    else:
+                                        self._tqm.send_callback('v2_playbook_on_task_start', task, is_conditional=False)
+                                    self._queue_task(host, task, task_vars, play_context)
+                                    # each task is counted as a worker being busy
+                                    workers_free -= 1
+                                    del task_vars
                     else:
                         display.debug("%s is blocked, skipping for now" % host_name)
 

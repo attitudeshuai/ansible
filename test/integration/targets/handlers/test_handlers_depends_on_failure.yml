@@ -1,0 +1,43 @@
+---
+- name: handler failure only skips handlers depending on the failed handler
+  hosts: localhost
+  gather_facts: false
+  vars:
+    handler_order: ''
+  tasks:
+    - name: notify all handlers
+      set_fact:
+        handler_order: ''
+      changed_when: true
+      notify:
+        - before_failure
+        - failing_handler
+        - direct_dependent
+        - transitive_dependent
+        - unrelated_after
+    - meta: flush_handlers
+    - name: this task must not run because the play failed
+      fail:
+        msg: play continued past the failed handler
+  handlers:
+    - name: before_failure
+      set_fact:
+        handler_order: "{{ handler_order ~ 'before;' }}"
+
+    - name: failing_handler
+      fail:
+        msg: intentional failure for handler depends_on tests
+
+    - name: direct_dependent
+      set_fact:
+        handler_order: "{{ handler_order ~ 'direct;' }}"
+      depends_on: failing_handler
+
+    - name: transitive_dependent
+      set_fact:
+        handler_order: "{{ handler_order ~ 'transitive;' }}"
+      depends_on: direct_dependent
+
+    - name: unrelated_after
+      set_fact:
+        handler_order: "{{ handler_order ~ 'unrelated;' }}"

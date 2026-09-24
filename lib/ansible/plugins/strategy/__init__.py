@@ -32,14 +32,13 @@ from collections import deque
 
 from ansible import constants as C, constants
 from ansible import context
-from ansible.errors import AnsibleError, AnsibleTemplateError
+from ansible.errors import AnsibleError
 from ansible.executor.play_iterator import IteratingStates, PlayIterator
 from ansible.executor.process.worker import WorkerProcess
 from ansible._internal._task import WireTaskResult, HostTaskResult
 from ansible.executor.task_queue_manager import CallbackSend, DisplaySend, PromptSend, TaskQueueManager
-from ansible.module_utils.common.text.converters import to_text
 from ansible.module_utils.connection import Connection, ConnectionError
-from ansible.playbook.handler import Handler
+from ansible.playbook.handler import Handler, resolve_handlers_by_notification
 from ansible.playbook.helpers import load_list_of_blocks
 from ansible.playbook.included_file import IncludedFile
 from ansible.playbook.play_context import PlayContext
@@ -317,6 +316,10 @@ class StrategyBase:
                 except KeyError:
                     iterator.get_next_task_for_host(self._inventory.get_host(host))
 
+        # handlers added through dynamic includes are all known by now,
+        # so perform the final strict dependency validation
+        iterator.validate_handler_dependencies()
+
         # return the appropriate code, depending on the status hosts after the run
         if not isinstance(result, bool) and result != self._tqm.RUN_OK:
             return result
@@ -467,58 +470,38 @@ class StrategyBase:
 
     def search_handlers_by_notification(self, notification: str, iterator: PlayIterator) -> t.Generator[Handler, None, None]:
         handlers = [h for b in reversed(iterator._play.handlers) for h in b.block]
-        # iterate in reversed order since last handler loaded with the same name wins
-        for handler in handlers:
-            if not handler.name:
-                continue
 
-            if not handler.cached_name:
-                def variables_factory() -> dict[str, t.Any]:
-                    return self._variable_manager.get_vars(
-                        play=iterator._play,
-                        task=handler,
-                        _hosts=self._hosts_cache,
-                        _hosts_all=self._hosts_cache_all
-                    )
+        def templar_factory(handler: Handler) -> TemplateEngine:
+            def variables_factory() -> dict[str, t.Any]:
+                return self._variable_manager.get_vars(
+                    play=iterator._play,
+                    task=handler,
+                    _hosts=self._hosts_cache,
+                    _hosts_all=self._hosts_cache_all
+                )
 
-                templar = TemplateEngine(variables_factory=variables_factory)
+            return TemplateEngine(variables_factory=variables_factory)
 
-                try:
-                    handler.name = templar.template(handler.name)
-                except AnsibleTemplateError as e:
-                    # We skip this handler due to the fact that it may be using
-                    # a variable in the name that was conditionally included via
-                    # set_fact or some other method, and we don't want to error
-                    # out unnecessarily
-                    if not handler.listen:
-                        display.warning(
-                            "Handler '%s' is unusable because it has no listen topics and "
-                            "the name could not be templated (host-specific variables are "
-                            "not supported in handler names). The error: %s" % (handler.name, to_text(e))
-                        )
-                    continue
+        # a name match resolves to the last defined handler with that name,
+        # while every handler listening on the topic is also returned
+        yield from resolve_handlers_by_notification(notification, handlers, templar_factory)
 
-                handler.cached_name = True
-
-            # first we check with the full result of get_name(), which may
-            # include the role name (if the handler is from a role). If that
-            # is not found, we resort to the simple name field, which doesn't
-            # have anything extra added to it.
-            if notification in {
-                handler.name,
-                handler.get_name(include_role_fqcn=False),
-                handler.get_name(include_role_fqcn=True),
-            }:
-                yield handler
-                break
-
-        seen = set()
-        for handler in handlers:
-            if notification in handler.listen:
-                if handler.name and handler.name in seen:
-                    continue
-                seen.add(handler.name)
-                yield handler
+    def _skip_blocked_handler(self, host, handler, blocked_by):
+        """Emit a skipped result for a handler skipped because of a failed dependency."""
+        display.vv(
+            "Skipping handler '%s' for host '%s', blocked by failed handler '%s'"
+            % (handler.get_name(), host.name, blocked_by)
+        )
+        note = "Skipped because handler '%s' it depends on failed on this host." % blocked_by
+        utr = _task.UnifiedTaskResult.from_action_result_dict({'depends_on_note': note})
+        utr.set_skipped(
+            "Handler skipped due to failed handler dependency: '%s' failed on this host." % blocked_by
+        )
+        task_result = HostTaskResult(host=host, task=handler, utr=utr)
+        self._tqm._stats.increment('skipped', host.name)
+        self._tqm.send_callback('v2_playbook_on_handler_task_start', handler)
+        self._tqm.send_callback('v2_runner_on_skipped', task_result)
+        return task_result
 
     def _process_rpc_queue(self) -> None:
         try:
@@ -554,6 +537,21 @@ class StrategyBase:
             # all host status messages contain 2 entries: (msg, task_result)
             role_ran = False
 
+            # a handler may have declared dependencies that were never notified
+            # for this host during this flush; surface that with the handler result
+            if isinstance(original_task, Handler):
+                unrun_dependencies = iterator.get_handler_unrun_dependencies(original_host, original_task)
+                if unrun_dependencies:
+                    note = (
+                        "the following handler dependencies were not notified and did not run "
+                        "during this flush: %s" % ", ".join(unrun_dependencies)
+                    )
+                    task_result.utr.result_data['depends_on_note'] = note
+                    display.warning(
+                        "Handler '%s' on host '%s' ran even though %s"
+                        % (original_task.get_name(), original_host.name, note)
+                    )
+
             if task_result.utr.failed:
                 role_ran = True
                 ignore_errors = task_result.utr.ignore_errors
@@ -563,7 +561,19 @@ class StrategyBase:
                     state_when_failed = iterator.get_state_for_host(original_host.name)
                     display.debug("marking %s as failed" % original_host.name)
 
-                    if original_task.run_once:
+                    if isinstance(original_task, Handler) and state_when_failed.run_state == IteratingStates.HANDLERS:
+                        # handler failure isolation: keep flushing this host, skipping
+                        # only handlers that (transitively) depend on the failed one
+                        if original_task.run_once:
+                            for h in self._inventory.get_hosts(iterator._play.hosts):
+                                if h.name not in self._tqm._unreachable_hosts:
+                                    if not iterator.record_handler_failure(h, original_task):
+                                        iterator.mark_host_failed(h)
+                        else:
+                            iterator.record_handler_failure(original_host, original_task)
+
+                        self._tqm._failed_hosts[original_host.name] = True
+                    elif original_task.run_once:
                         # if we're using run_once, we have to fail every host here
                         for h in self._inventory.get_hosts(iterator._play.hosts):
                             if h.name not in self._tqm._unreachable_hosts:
@@ -571,10 +581,14 @@ class StrategyBase:
                     else:
                         iterator.mark_host_failed(original_host)
 
-                    state, dummy = iterator.get_next_task_for_host(original_host, peek=True)
+                    if not (
+                        isinstance(original_task, Handler)
+                        and state_when_failed.run_state == IteratingStates.HANDLERS
+                    ):
+                        state, dummy = iterator.get_next_task_for_host(original_host, peek=True)
 
-                    if iterator.is_failed(original_host) and state and state.run_state == IteratingStates.COMPLETE:
-                        self._tqm._failed_hosts[original_host.name] = True
+                        if iterator.is_failed(original_host) and state and state.run_state == IteratingStates.COMPLETE:
+                            self._tqm._failed_hosts[original_host.name] = True
 
                     # if we're iterating on the rescue portion of a block then
                     # we save the failed task in a special var for use

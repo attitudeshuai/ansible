@@ -1,0 +1,19 @@
+---
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        dep: 1
+      changed_when: true
+      notify: dep_a
+  handlers:
+    - name: dep_a
+      set_fact:
+        dep: 2
+
+    - name: dep_b
+      set_fact:
+        dep: 3
+      depends_on:
+        - dep_a
+        - dep_a

@@ -1,0 +1,4 @@
+---
+- name: role task
+  set_fact:
+    handler_deps_role_task_ran: true

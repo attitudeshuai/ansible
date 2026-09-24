@@ -1,0 +1,111 @@
+---
+- name: handlers execute in dependency order, unrelated handlers keep definition order
+  hosts: localhost
+  gather_facts: false
+  vars:
+    handler_order: ''
+  tasks:
+    - name: notify every handler out of order
+      set_fact:
+        handler_order: ''
+      changed_when: true
+      notify:
+        - reload
+        - independent
+        - restart
+        - stop_a
+        - stop_b
+    - meta: flush_handlers
+    - name: assert dependency order
+      assert:
+        that:
+          - handler_order == 'independent;stop_a;stop_b;restart;reload;'
+  handlers:
+    - name: reload
+      set_fact:
+        handler_order: "{{ handler_order ~ 'reload;' }}"
+      depends_on: restart
+
+    - name: independent
+      set_fact:
+        handler_order: "{{ handler_order ~ 'independent;' }}"
+
+    - name: restart
+      set_fact:
+        handler_order: "{{ handler_order ~ 'restart;' }}"
+      depends_on: stop_group
+
+    - name: stop_a
+      set_fact:
+        handler_order: "{{ handler_order ~ 'stop_a;' }}"
+      listen: stop_group
+
+    - name: stop_b
+      set_fact:
+        handler_order: "{{ handler_order ~ 'stop_b;' }}"
+      listen: stop_group
+
+- name: a handler notified during the flush is ordered by dependencies and never reruns
+  hosts: localhost
+  gather_facts: false
+  vars:
+    handler_order: ''
+  tasks:
+    - name: start the notification chain
+      set_fact:
+        handler_order: ''
+      changed_when: true
+      notify: first
+    - meta: flush_handlers
+    - assert:
+        that:
+          - first_runs == 1
+          - later_runs == 1
+          - delayed_runs == 1
+          - handler_order == 'first;later;delayed;'
+  handlers:
+    - name: first
+      set_fact:
+        handler_order: "{{ handler_order ~ 'first;' }}"
+        first_runs: "{{ (first_runs | default(0)) | int + 1 }}"
+      changed_when: true
+      # 'later' is already part of the flush, while 'delayed' only becomes
+      # reachable once this handler runs
+      notify:
+        - later
+        - delayed
+
+    - name: later
+      set_fact:
+        handler_order: "{{ handler_order ~ 'later;' }}"
+        later_runs: "{{ (later_runs | default(0)) | int + 1 }}"
+
+    - name: delayed
+      set_fact:
+        handler_order: "{{ handler_order ~ 'delayed;' }}"
+        delayed_runs: "{{ (delayed_runs | default(0)) | int + 1 }}"
+      depends_on: later
+
+- name: a handler runs when its dependency was never notified, the result notes it
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: notify only the dependent handler
+      set_fact:
+        dep: 1
+      changed_when: true
+      notify: needy
+    - meta: flush_handlers
+    - assert:
+        that:
+          - needy_ran is defined
+          - optional_ran is not defined
+  handlers:
+    - name: needy
+      set_fact:
+        needy_ran: true
+      depends_on: optional
+
+    - name: optional
+      set_fact:
+        optional_ran: true

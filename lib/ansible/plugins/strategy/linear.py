@@ -91,7 +91,9 @@ class StrategyModule(StrategyBase):
                 host_tasks.append((host, task))
 
         if cur_task._get_meta() == 'flush_handlers':
-            iterator.all_tasks[iterator.cur_task:iterator.cur_task] = [h for b in iterator._play.handlers for h in b.block]
+            # insert handlers in dependency order so each host's notified
+            # handler order remains a subsequence of the lockstep task list
+            iterator.all_tasks[iterator.cur_task:iterator.cur_task] = iterator.handler_flush_order()
 
         return host_tasks
 
@@ -140,6 +142,15 @@ class StrategyModule(StrategyBase):
                     self.add_tqm_variables(task_vars, play=iterator._play)
                     templar = TemplateEngine(loader=self._loader, variables=task_vars)
                     display.debug("done getting variables")
+
+                    if isinstance(task, Handler) and (blocked_by := iterator.handler_blocked_reason(host, task)):
+                        # a dependency of this handler failed on the host; skip it instead of running it
+                        results.append(self._skip_blocked_handler(host, task, blocked_by))
+                        if templar.template(task.run_once):
+                            task.clear_hosts()
+                            break
+                        task.remove_host(host)
+                        continue
 
                     # test to see if the task across all hosts points to an action plugin which
                     # sets BYPASS_HOST_LOOP to true, or if it has run_once enabled. If so, we

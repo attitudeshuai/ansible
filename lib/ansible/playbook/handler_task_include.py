@@ -24,7 +24,7 @@ from ansible.playbook.task_include import TaskInclude
 
 class HandlerTaskInclude(Handler, TaskInclude):
 
-    VALID_INCLUDE_KEYWORDS = TaskInclude.VALID_INCLUDE_KEYWORDS.union(('listen',))
+    VALID_INCLUDE_KEYWORDS = TaskInclude.VALID_INCLUDE_KEYWORDS.union(('listen', 'depends_on'))
 
     @staticmethod
     def load(data, block=None, role=None, task_include=None, variable_manager=None, loader=None):

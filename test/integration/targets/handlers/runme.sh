@@ -239,3 +239,55 @@ ANSIBLE_DEBUG=1 ansible-playbook tagged_play.yml --tags task_tag "$@" 2>&1 | tee
 [ "$(grep out.txt -ce 'META: triggered running handlers')" = "1" ]
 [ "$(grep out.txt -ce 'handler_ran')" = "0" ]
 [ "$(grep out.txt -ce 'handler1_ran')" = "1" ]
+
+# handler depends_on: explicit ordering and handler failure isolation
+for strategy in linear free; do
+
+  export ANSIBLE_STRATEGY=$strategy
+
+  ansible-playbook test_handlers_depends_on.yml -i inventory.handlers -v "$@" 2>&1 | tee out.txt
+  grep -F -q "did not run during this flush: optional" out.txt
+
+  ansible-playbook test_handlers_depends_on_role.yml -i inventory.handlers "$@"
+
+  # failure isolation: dependents are skipped naming the failed handler,
+  # unrelated handlers keep running and the play still fails
+  set +e
+  result="$(ansible-playbook test_handlers_depends_on_failure.yml -i inventory.handlers -v "$@" 2>&1)"
+  failure_rc=$?
+  set -e
+  [ $failure_rc -ne 0 ]
+  grep -F -q "RUNNING HANDLER [before_failure]" <<< "$result"
+  grep -F -q "RUNNING HANDLER [failing_handler]" <<< "$result"
+  grep -F -q "RUNNING HANDLER [direct_dependent]" <<< "$result"
+  grep -F -q "RUNNING HANDLER [transitive_dependent]" <<< "$result"
+  grep -F -q "RUNNING HANDLER [unrelated_after]" <<< "$result"
+  grep -F -q "Handler skipped due to failed handler dependency: 'failing_handler' failed on this host." <<< "$result"
+  [ "$(grep -F -c "RUNNING HANDLER [direct_dependent]" <<< "$result")" = "1" ]
+  [ "$(grep -F -c "RUNNING HANDLER [transitive_dependent]" <<< "$result")" = "1" ]
+  [ "$(grep -F -c "RUNNING HANDLER [unrelated_after]" <<< "$result")" = "1" ]
+  if grep -F -q "this task must not run" <<< "$result"; then
+    exit 1
+  fi
+
+  unset ANSIBLE_STRATEGY
+
+done
+
+# invalid handler dependency declarations fail and name the handlers involved
+for pb in missing cycle duplicate; do
+  set +e
+  result="$(ansible-playbook test_handlers_depends_on_${pb}.yml -i inventory.handlers "$@" 2>&1)"
+  set -e
+  case "$pb" in
+    missing)
+      grep -F -q "depends on 'handler_that_does_not_exist', but no handler" <<< "$result"
+      ;;
+    cycle)
+      grep -F -q "Handler dependency cycle detected: cycle_a -> cycle_b -> cycle_a" <<< "$result"
+      ;;
+    duplicate)
+      grep -F -q "declares a duplicate dependency on 'dep_a'" <<< "$result"
+      ;;
+  esac
+done

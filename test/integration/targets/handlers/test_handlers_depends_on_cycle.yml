@@ -1,0 +1,16 @@
+---
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        dep: 1
+  handlers:
+    - name: cycle_a
+      set_fact:
+        dep: 2
+      depends_on: cycle_b
+
+    - name: cycle_b
+      set_fact:
+        dep: 3
+      depends_on: cycle_a

@@ -23,9 +23,12 @@ from enum import IntEnum, IntFlag
 
 from ansible import constants as C
 from ansible.errors import AnsibleAssertionError
+from ansible.executor.handler_dependency import HandlerDependencyGraph
 from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.playbook.block import Block
+from ansible.playbook.handler import resolve_handlers_by_notification
 from ansible.playbook.task import Task
+from ansible._internal._templating._engine import TemplateEngine
 from ansible.utils.display import Display
 
 
@@ -71,6 +74,10 @@ class HostState:
         self.fail_state = FailedStates.NONE
         self.pre_flushing_run_state = None
         self.update_handlers = True
+        # per-flush handler dependency bookkeeping
+        self.handler_done = set()
+        self.handler_failures = {}
+        self.handler_graph = None
         self.tasks_child_state = None
         self.rescue_child_state = None
         self.always_child_state = None
@@ -130,6 +137,9 @@ class HostState:
         new_state.fail_state = self.fail_state
         new_state.pre_flushing_run_state = self.pre_flushing_run_state
         new_state.update_handlers = self.update_handlers
+        new_state.handler_done = self.handler_done.copy()
+        new_state.handler_failures = self.handler_failures.copy()
+        new_state.handler_graph = self.handler_graph
         new_state.did_rescue = self.did_rescue
         new_state.did_start_at_task = self.did_start_at_task
         if self.tasks_child_state is not None:
@@ -145,6 +155,7 @@ class PlayIterator:
 
     def __init__(self, inventory, play, play_context, variable_manager, all_vars, start_at_done=False):
         self._play = play
+        self._inventory = inventory
         self._blocks = []
         self._variable_manager = variable_manager
 
@@ -212,7 +223,19 @@ class PlayIterator:
         # the copy happens at each flush in order to restore the original
         # list and remove any included handlers that might not be notified
         # at the particular flush
-        self.handlers = [h for b in self._play.handlers for h in b.block]
+        self._handlers = [h for b in self._play.handlers for h in b.block]
+        # validate strictly at play start unless handlers can still appear through
+        # a dynamic include_role or handlers including more handlers at run time;
+        # for those plays the graph is validated strictly again at flush time
+        may_include_handlers = (
+            any(type(task).__name__ == 'IncludeRole' for task in self.all_tasks)
+            or any(type(handler).__name__ == 'HandlerTaskInclude' for handler in self._handlers)
+        )
+        self._handler_graph = HandlerDependencyGraph.build(
+            self._handlers,
+            self._resolve_handler_dependency(self._handlers),
+            strict_missing=not may_include_handlers,
+        )
 
         self._host_states = {}
         start_at_matched = False
@@ -246,6 +269,151 @@ class PlayIterator:
 
         self.end_play = False
         self.cur_task = 0
+
+    @property
+    def handlers(self):
+        # flat list of all currently known handlers in definition order
+        return self._handlers
+
+    @handlers.setter
+    def handlers(self, handler_list):
+        # refreshed when include_role/import_role add handler blocks;
+        # the graph is validated strictly again when the next flush starts
+        self._handlers = list(handler_list)
+        self._handler_graph = HandlerDependencyGraph.build(
+            self._handlers, self._resolve_handler_dependency(self._handlers), strict_missing=False
+        )
+
+    def handler_flush_order(self):
+        # all known handlers in global dependency order, used by lockstep
+        # strategies so that each per-host order remains a subsequence
+        return self._handler_graph.ordered(self._handlers)
+
+    def validate_handler_dependencies(self) -> None:
+        """Strictly validate the dependencies of all handlers currently known.
+
+        Used at the end of a play whose handlers could not be fully validated
+        up front, typically because some handlers were added by dynamic
+        include_role/include_tasks while the play ran.
+        """
+        HandlerDependencyGraph.build(self._handlers, self._resolve_handler_dependency(self._handlers))
+
+    def _resolve_handler_dependency(self, handlers):
+        """Return a resolver matching handler names/listen topics within the given handler universe."""
+        play = self._play
+        variable_manager = self._variable_manager
+        host_names = [host.name for host in self._inventory.get_hosts(play.hosts, order=play.order)]
+        reversed_handlers = list(reversed(list(handlers)))
+
+        def resolver(notification):
+            def templar_factory(handler):
+                def variables_factory():
+                    return variable_manager.get_vars(
+                        play=play,
+                        task=handler,
+                        _hosts=host_names,
+                        _hosts_all=host_names,
+                    )
+
+                return TemplateEngine(variables_factory=variables_factory)
+
+            return resolve_handlers_by_notification(notification, reversed_handlers, templar_factory)
+
+        return resolver
+
+    def _get_next_handler_task(self, state, host):
+        """Return the next handler due for this host, ordered by dependencies.
+
+        Only handlers notified for the host participate; handlers already
+        selected during the current flush are never selected again.
+        """
+        pending = [
+            handler for handler in state.handlers
+            if handler._uuid not in state.handler_done and handler.is_host_notified(host)
+        ]
+        if not pending:
+            return None
+
+        if state.handler_graph is not None:
+            pending = state.handler_graph.ordered(pending)
+
+        task = pending[0]
+        state.handler_done.add(task._uuid)
+        return task
+
+    def record_handler_failure(self, host, handler):
+        """Record a failed handler without aborting the current flush.
+
+        Returns True when the host is currently flushing handlers (the
+        failure is isolated and dependent handlers will be skipped), False
+        when the caller should fall back to the classic failure handling.
+        """
+        state = self.get_state_for_host(host.name)
+        if state.run_state != IteratingStates.HANDLERS:
+            return False
+
+        state.handler_failures[handler._uuid] = handler.get_name()
+        self.set_state_for_host(host.name, state)
+        self._play._removed_hosts.append(host.name)
+        return True
+
+    def handler_blocked_reason(self, host, handler):
+        """Name of the failed handler that blocks this handler, or None."""
+        state = self._host_states.get(host.name)
+        if state is None or not state.handler_failures or state.handler_graph is None:
+            return None
+        return self._failed_dependency_name(state, handler._uuid)
+
+    @staticmethod
+    def _failed_dependency_name(state, uuid):
+        graph = state.handler_graph
+        failure_ids = set(state.handler_failures)
+        universe = {handler._uuid for handler in state.handlers}
+
+        # walk the dependency chain looking for failed ancestors
+        seen = {uuid}
+        stack = [uuid]
+        roots = []
+        while stack:
+            current = stack.pop()
+            if current in failure_ids:
+                roots.append(current)
+                continue
+            for dependency in graph.dependencies(current):
+                if dependency in universe and dependency not in seen:
+                    seen.add(dependency)
+                    stack.append(dependency)
+
+        if not roots:
+            return None
+
+        order = {handler._uuid: idx for idx, handler in enumerate(state.handlers)}
+        root = min(roots, key=lambda x: order.get(x, len(order)))
+        return state.handler_failures[root]
+
+    def get_handler_unrun_dependencies(self, host, handler):
+        """Display names of declared dependencies that did not run during this flush."""
+        state = self._host_states.get(host.name)
+        if state is None or state.handler_graph is None or handler._uuid not in state.handler_done:
+            return []
+
+        order = {handler_obj._uuid: idx for idx, handler_obj in enumerate(state.handlers)}
+        by_uuid = {handler_obj._uuid: handler_obj for handler_obj in state.handlers}
+
+        names = []
+        for dependency in sorted(state.handler_graph.dependencies(handler._uuid), key=lambda d: order.get(d, len(order))):
+            dependency_handler = by_uuid.get(dependency)
+            if dependency_handler is None:
+                continue
+            if dependency in state.handler_done:
+                continue
+            if dependency_handler.is_host_notified(host):
+                # still pending for this host; dependency ordering prevents this in practice
+                continue
+            name = dependency_handler.get_name()
+            if name not in names:
+                names.append(name)
+        return names
 
     def get_host_state(self, host):
         # Since we're using the PlayIterator to carry forward failed hosts,
@@ -429,21 +597,35 @@ class PlayIterator:
                     # reset handlers for HostState since handlers from include_tasks
                     # might be there from previous flush
                     state.handlers = self.handlers[:]
+                    # strict validation over every handler known at this point,
+                    # including handlers added through earlier dynamic includes
+                    state.handler_graph = HandlerDependencyGraph.build(
+                        state.handlers, self._resolve_handler_dependency(state.handlers)
+                    )
+                    state.handler_done = set()
+                    state.handler_failures = {}
+                    state.cur_handlers_task = 0
                     state.update_handlers = False
 
-                while True:
-                    try:
-                        task = state.handlers[state.cur_handlers_task]
-                    except IndexError:
-                        task = None
-                        state.cur_handlers_task = 0
-                        state.run_state = state.pre_flushing_run_state
-                        state.update_handlers = True
-                        break
-                    else:
-                        state.cur_handlers_task += 1
-                        if task.is_host_notified(host):
-                            return state, task
+                handler_task = self._get_next_handler_task(state, host)
+                if handler_task is not None:
+                    # handlers are returned directly, without the implicit/role
+                    # bookkeeping filters applied to regular tasks
+                    return state, handler_task
+
+                # this host has no more notified handlers in this flush
+                state.cur_handlers_task = 0
+                handler_failures = state.handler_failures
+                state.run_state = state.pre_flushing_run_state
+                state.update_handlers = True
+                state.handler_graph = None
+                state.handler_done = set()
+                state.handler_failures = {}
+                if handler_failures:
+                    # a handler failed during the flush; unrelated handlers were
+                    # still executed, now move the host into the same failed state
+                    # it would have entered had the failure aborted the flush
+                    state = self._set_failed_state(state)
 
             elif state.run_state == IteratingStates.COMPLETE:
                 return (state, None)
@@ -621,7 +803,13 @@ class PlayIterator:
                 target_block.always[state.cur_always_task:state.cur_always_task] = task_list
                 state._blocks[state.cur_block] = target_block
         elif state.run_state == IteratingStates.HANDLERS:
-            state.handlers[state.cur_handlers_task:state.cur_handlers_task] = [h for b in task_list for h in b.block]
+            # handlers included from a handler run next, at the current point
+            new_handlers = [h for b in task_list for h in b.block]
+            state.handlers[0:0] = new_handlers
+            # validate and take dependency ordering for the included handlers too
+            state.handler_graph = HandlerDependencyGraph.build(
+                state.handlers, self._resolve_handler_dependency(state.handlers)
+            )
 
         return state
 

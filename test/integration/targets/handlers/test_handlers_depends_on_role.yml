@@ -1,0 +1,25 @@
+---
+- name: a play handler can depend on a role handler
+  hosts: localhost
+  gather_facts: false
+  vars:
+    cross_role_order: ''
+  roles:
+    - handler_deps_role
+  tasks:
+    - name: notify the role handler and the dependent play handler
+      set_fact:
+        cross_role_order: ''
+      changed_when: true
+      notify:
+        - "handler_deps_role : role_handler"
+        - play_handler
+    - meta: flush_handlers
+    - assert:
+        that:
+          - cross_role_order == 'role;play;'
+  handlers:
+    - name: play_handler
+      set_fact:
+        cross_role_order: "{{ cross_role_order ~ 'play;' }}"
+      depends_on: "handler_deps_role : role_handler"

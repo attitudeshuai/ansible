@@ -1,0 +1,11 @@
+minor_changes:
+  - handlers - added a ``depends_on`` keyword for handlers. It takes a list of
+    handler names or ``listen`` topics that the handler depends on; within a
+    handler flush the listed handlers run before the handler that declares the
+    dependency, while handlers without a dependency relationship keep their
+    definition order. Dependency declarations are validated (missing targets,
+    cycles and duplicate declarations are errors).
+  - handlers - when a handler fails during a handler flush, only handlers that
+    (transitively) depend on it are skipped (with the failed handler named in
+    the skip result); unrelated handlers now still run on the host. The host is
+    marked failed with the same failure summary as before once the flush ends.

@@ -1,0 +1,4 @@
+---
+- name: role_handler
+  set_fact:
+    cross_role_order: "{{ (cross_role_order | default('')) ~ 'role;' }}"
