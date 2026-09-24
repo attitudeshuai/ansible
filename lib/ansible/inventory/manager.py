@@ -18,6 +18,7 @@
 #############################################
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import functools
 import os
@@ -30,6 +31,7 @@ from random import shuffle
 
 from ansible import constants as C
 from ansible._internal import _json, _wrapt
+from ansible._internal._inventory import _mergeplan, _provenance, _adjudication
 from ansible._internal._json import EncryptedStringBehavior
 from ansible.errors import AnsibleError, AnsibleOptionsError
 from ansible.inventory.data import InventoryData
@@ -147,7 +149,9 @@ def split_host_pattern(pattern):
 class InventoryManager:
     """ Creates and manages inventory """
 
-    def __init__(self, loader: DataLoader, sources: list[str] | str | None = None, parse: bool = True, cache: bool = True) -> None:
+    def __init__(self, loader: DataLoader, sources: list[str] | str | None = None, parse: bool = True, cache: bool = True,
+                 merge_plan: str | os.PathLike[str] | t.Mapping[str, t.Any] | _mergeplan.MergePlan | None = None,
+                 merge_trace: bool = False) -> None:
 
         # base objects
         self._loader = loader
@@ -169,12 +173,41 @@ class InventoryManager:
         else:
             self._sources = sources
 
+        # optional merge plan declaring source parse order and per-source conflict strategies;
+        # None keeps the historical parse order, last-wins result and zero-overhead code path
+        self._resolved_plan: _mergeplan.ResolvedPlan | None = None
+        if merge_plan is not None:
+            # validated entirely before any plugin runs (invalid declarations raise here, not during parsing)
+            self._resolved_plan = _mergeplan.load_merge_plan(merge_plan, sources=self._sources, loader=self._loader)
+
+        # trace-only mode records provenance without a plan, using CLI order and legacy last_wins semantics
+        self._merge_trace_requested = merge_trace
+
+        self._init_merge_tracker()
+
         # get to work!
         if parse:
             self.parse_sources(cache=cache)
 
         self._cached_dynamic_hosts: list[AddHost] = []
         self._cached_dynamic_grouping: list[tuple[str, AddGroup]] = []
+
+    def _init_merge_tracker(self) -> None:
+        """Create and attach a fresh provenance tracker when a merge plan or trace-only mode is active."""
+        if self._resolved_plan is not None:
+            ordered = self._resolved_plan.ordered_sources
+        elif self._merge_trace_requested:
+            ordered = _mergeplan.default_order(self._sources).ordered_sources
+        else:
+            self._inventory._merge_tracker = None
+            return
+
+        self._inventory._merge_tracker = _provenance.MergeProvenance(ordered)
+
+    @property
+    def merge_trace(self) -> _provenance.MergeProvenance | None:
+        """The provenance ledger for this inventory, or ``None`` in the default zero-overhead mode."""
+        return self._inventory._merge_tracker
 
     @property
     def localhost(self):
@@ -227,7 +260,13 @@ class InventoryManager:
 
         parsed = False
         # allow for multiple inventory parsing
-        for source in self._sources:
+        if self.merge_trace is not None:
+            # declared merge order; trace-only mode preserves the CLI order with legacy last_wins semantics
+            parse_entries = self._effective_sources()
+        else:
+            parse_entries = self._sources
+
+        for source in parse_entries:
 
             if source:
                 if ',' not in source:
@@ -235,6 +274,14 @@ class InventoryManager:
                 parse = self.parse_source(source, cache=cache)
                 if parse and not parsed:
                     parsed = True
+
+        if self.merge_trace is not None:
+            # all sources have been parsed; adjudicate variable conflicts per the declared strategies and
+            # rebuild effective variables. The aggregated 'error' strategy failure is raised here, before
+            # reconcile and vars-plugin layering, so no half-merged inventory is ever consumed.
+            adjudication_result = _adjudication.adjudicate(self.merge_trace, self._inventory)
+            if adjudication_result.conflicts:
+                raise _adjudication.InventoryMergeConflictError(adjudication_result)
 
         if parsed:
             # do post processing
@@ -250,79 +297,103 @@ class InventoryManager:
         for host in self.hosts.values():
             host.vars = combine_vars(host.vars, get_vars_from_inventory_sources(self._loader, self._sources, [host], 'inventory'))
 
-    def parse_source(self, source, cache=False):
+    def _effective_sources(self) -> list[str]:
+        """Sources to parse, in declared order when a merge plan is active (raw CLI strings, unfrackpath applied later)."""
+        return [o.source for o in self.merge_trace.ordered_sources]
+
+    def parse_source(self, source, cache=False, _parent_source=None, _member_order=None):
         """ Generate or update inventory for the source provided """
 
         parsed = False
         failures = []
         display.debug(u'Examining possible inventory source: %s' % source)
 
+        tracker = self.merge_trace
+
         # use binary for path functions
         b_source = to_bytes(source)
 
         # process directories as a collection of inventories
         if os.path.isdir(b_source):
-            display.debug(u'Searching for inventory files in directory: %s' % source)
-            for i in sorted(os.listdir(b_source)):
+            dir_cm = tracker.source_frame(source) if tracker is not None else contextlib.nullcontext()
+            with dir_cm:
+                display.debug(u'Searching for inventory files in directory: %s' % source)
+                for i in sorted(os.listdir(b_source)):
 
-                display.debug(u'Considering %s' % i)
-                # Skip hidden files and stuff we explicitly ignore
-                if IGNORED.search(i):
-                    continue
+                    display.debug(u'Considering %s' % i)
+                    # Skip hidden files and stuff we explicitly ignore
+                    if IGNORED.search(i):
+                        continue
 
-                # recursively deal with directory entries
-                fullpath = to_text(os.path.join(b_source, i), errors='surrogate_or_strict')
-                parsed_this_one = self.parse_source(fullpath, cache=cache)
-                display.debug(u'parsed %s as %s' % (fullpath, parsed_this_one))
-                if not parsed:
-                    parsed = parsed_this_one
+                    # recursively deal with directory entries; each member is traced as its own source
+                    fullpath = to_text(os.path.join(b_source, i), errors='surrogate_or_strict')
+                    member_order = tracker.next_member_order() if tracker is not None else None
+                    parsed_this_one = self.parse_source(
+                        fullpath, cache=cache, _parent_source=source, _member_order=member_order)
+                    display.debug(u'parsed %s as %s' % (fullpath, parsed_this_one))
+                    if not parsed:
+                        parsed = parsed_this_one
         else:
             # left with strings or files, let plugins figure it out
 
             # set so new hosts can use for inventory_file/dir vars
             self._inventory.current_source = source
 
-            # try source with each plugin
-            for plugin in self._fetch_inventory_plugins():
-                plugin_name = to_text(getattr(plugin, '_load_name', getattr(plugin, '_original_path', '')))
-                display.debug(u'Attempting to use plugin %s (%s)' % (plugin_name, plugin._original_path))
+            if tracker is not None:
+                source_cm = tracker.source_frame(
+                    source, parent_source=_parent_source, order=_member_order, member=bool(_parent_source))
+            else:
+                source_cm = contextlib.nullcontext()
 
-                # initialize and figure out if plugin wants to attempt parsing this file
-                try:
-                    plugin_wants = bool(plugin.verify_file(source))
-                except Exception:
-                    plugin_wants = False
+            with source_cm:
+                # try source with each plugin
+                for plugin in self._fetch_inventory_plugins():
+                    plugin_name = to_text(getattr(plugin, '_load_name', getattr(plugin, '_original_path', '')))
+                    # prefer the fully-qualified plugin name (e.g. ansible.builtin.yaml) for provenance output
+                    plugin_display_name = getattr(plugin, 'ansible_name', None) or plugin_name
+                    display.debug(u'Attempting to use plugin %s (%s)' % (plugin_name, plugin._original_path))
 
-                if plugin_wants:
-                    # have this tag ready to apply to errors or output; str-ify source since it is often tagged by the CLI
-                    origin = Origin(description=f'<inventory plugin {plugin_name!r} with source {str(source)!r}>')
+                    # initialize and figure out if plugin wants to attempt parsing this file
                     try:
-                        inventory_wrapper = _InventoryDataWrapper(self._inventory, target_plugin=plugin, origin=origin)
+                        plugin_wants = bool(plugin.verify_file(source))
+                    except Exception:
+                        plugin_wants = False
 
-                        # FUTURE: now that we have a wrapper around inventory, we can have it use ChainMaps to preview the in-progress inventory,
-                        #  but be able to roll back partial inventory failures by discarding the outermost layer
-                        plugin.parse(inventory_wrapper, self._loader, source, cache=cache)
+                    if plugin_wants:
+                        # have this tag ready to apply to errors or output; str-ify source since it is often tagged by the CLI
+                        origin = Origin(description=f'<inventory plugin {plugin_name!r} with source {str(source)!r}>')
                         try:
-                            plugin.update_cache_if_changed()
-                        except AttributeError:
-                            # some plugins might not implement caching
-                            pass
-                        parsed = True
-                        display.vvv('Parsed %s inventory source with %s plugin' % (source, plugin_name))
-                        break
-                    except AnsibleError as ex:
-                        if not ex.obj:
-                            ex.obj = origin
-                        failures.append({'src': source, 'plugin': plugin_name, 'exc': ex})
-                    except Exception as ex:
-                        # DTFIX-FUTURE: fix this error handling to correctly deal with messaging
-                        try:
-                            # omit line number to prevent contextual display of script or possibly sensitive info
-                            raise AnsibleError(str(ex), obj=origin) from ex
+                            inventory_wrapper = _InventoryDataWrapper(self._inventory, target_plugin=plugin, origin=origin)
+
+                            # FUTURE: now that we have a wrapper around inventory, we can have it use ChainMaps to preview the in-progress inventory,
+                            #  but be able to roll back partial inventory failures by discarding the outermost layer
+                            plugin_cm = tracker.plugin_context(plugin_display_name) if tracker is not None \
+                                else contextlib.nullcontext()
+                            with plugin_cm:
+                                plugin.parse(inventory_wrapper, self._loader, source, cache=cache)
+                                try:
+                                    plugin.update_cache_if_changed()
+                                except AttributeError:
+                                    # some plugins might not implement caching
+                                    pass
+                            parsed = True
+                            if tracker is not None:
+                                tracker.source_status[source].plugin = plugin_display_name
+                            display.vvv('Parsed %s inventory source with %s plugin' % (source, plugin_name))
+                            break
                         except AnsibleError as ex:
+                            if not ex.obj:
+                                ex.obj = origin
                             failures.append({'src': source, 'plugin': plugin_name, 'exc': ex})
-                else:
-                    display.vvv("%s declined parsing %s as it did not pass its verify_file() method" % (plugin_name, source))
+                        except Exception as ex:
+                            # DTFIX-FUTURE: fix this error handling to correctly deal with messaging
+                            try:
+                                # omit line number to prevent contextual display of script or possibly sensitive info
+                                raise AnsibleError(str(ex), obj=origin) from ex
+                            except AnsibleError as ex:
+                                failures.append({'src': source, 'plugin': plugin_name, 'exc': ex})
+                    else:
+                        display.vvv("%s declined parsing %s as it did not pass its verify_file() method" % (plugin_name, source))
 
         if parsed:
             self._inventory.processed_sources.append(self._inventory.current_source)
@@ -343,6 +414,9 @@ class InventoryManager:
                 else:
                     display.warning("Unable to parse %s as an inventory source" % source)
 
+        if tracker is not None:
+            tracker.mark_source(source, parsed)
+
         # clear up, jic
         self._inventory.current_source = None
 
@@ -358,6 +432,8 @@ class InventoryManager:
 
         self.clear_caches()
         self._inventory = InventoryData()
+        # rebuild provenance from scratch so no stale sources/proposals survive the refresh
+        self._init_merge_tracker()
         self.parse_sources(cache=False)
 
         for add_host in self._cached_dynamic_hosts:
@@ -802,3 +878,24 @@ class _InventoryDataWrapper(_wrapt.ObjectProxy):
 
     def set_variable(self, entity: str, varname: str, value: t.Any) -> None:
         self.__wrapped__.set_variable(entity, varname, self._inspector.visit(value))
+
+    def _merge_delegation(self, plugin: BaseInventoryPlugin):
+        """Context manager attributing subsequent writes to the plugin an ``auto``-style plugin delegates to."""
+        tracker = self.__wrapped__._merge_tracker
+        if tracker is None:
+            return contextlib.nullcontext()
+        plugin_name = getattr(plugin, 'ansible_name', None) \
+            or to_text(getattr(plugin, '_load_name', getattr(plugin, '_original_path', '')))
+        return tracker.delegation_context(plugin_name)
+
+    def _merge_derivation(self, *, step: str, host: str, expression: str, index: int | None = None):
+        """Context manager marking constructor-plugin (constructed) derivations with origin step and input sources."""
+        tracker = self.__wrapped__._merge_tracker
+        if tracker is None:
+            return contextlib.nullcontext()
+        return tracker.derivation_context(
+            step=step,
+            expression=expression,
+            index=index,
+            derived_from=tracker.host_defining_sources(host),
+        )

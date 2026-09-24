@@ -22,6 +22,7 @@ import sys
 import typing as t
 
 from ansible import constants as C
+from ansible._internal._inventory import _provenance
 from ansible.errors import AnsibleError
 from ansible.inventory.group import Group
 from ansible.inventory.host import Host
@@ -54,6 +55,9 @@ class InventoryData:
 
         self.current_source: str | None = None
         self.processed_sources: list[str] = []
+
+        # optional provenance tracker for merge-plan/trace mode; None keeps the historical zero-overhead path
+        self._merge_tracker: _provenance.MergeProvenance | None = None
 
         # Always create the 'all' and 'ungrouped' groups,
         for group in ('all', 'ungrouped'):
@@ -156,6 +160,8 @@ class InventoryData:
                     self.groups[group] = g
                     self._groups_dict_cache = {}
                     display.debug("Added group %s to inventory" % group)
+                    if self._merge_tracker:
+                        self._merge_tracker.record_group_defined(group)
             else:
                 display.debug("group %s already in inventory" % group)
         else:
@@ -194,12 +200,25 @@ class InventoryData:
             if host not in self.hosts:
                 h = Host(host, port)
                 self.hosts[host] = h
-                if self.current_source:  # set to 'first source' in which host was encountered
-                    self.set_variable(host, 'inventory_file', self.current_source)
-                    self.set_variable(host, 'inventory_dir', basedir(self.current_source))
+                if self._merge_tracker:
+                    # framework-provided per-host metadata, never attributed to a plugin
+                    with self._merge_tracker.internal_context():
+                        if self.current_source:  # set to 'first source' in which host was encountered
+                            self.set_variable(host, 'inventory_file', self.current_source)
+                            self.set_variable(host, 'inventory_dir', basedir(self.current_source))
+                        else:
+                            self.set_variable(host, 'inventory_file', None)
+                            self.set_variable(host, 'inventory_dir', None)
+                    if port:
+                        self._merge_tracker.record_variable(
+                            _provenance.EntityType.HOST, host, 'ansible_port', int(port), force_internal=True)
                 else:
-                    self.set_variable(host, 'inventory_file', None)
-                    self.set_variable(host, 'inventory_dir', None)
+                    if self.current_source:  # set to 'first source' in which host was encountered
+                        self.set_variable(host, 'inventory_file', self.current_source)
+                        self.set_variable(host, 'inventory_dir', basedir(self.current_source))
+                    else:
+                        self.set_variable(host, 'inventory_file', None)
+                        self.set_variable(host, 'inventory_dir', None)
                 display.debug("Added host %s to inventory" % host)
 
                 # set default localhost from inventory to avoid creating an implicit one. Last localhost defined 'wins'.
@@ -216,6 +235,11 @@ class InventoryData:
                 g.add_host(h)
                 self._groups_dict_cache = {}
                 display.debug("Added host %s to group %s" % (host, group))
+
+            if self._merge_tracker:
+                self._merge_tracker.record_host_defined(host)
+                if g:
+                    self._merge_tracker.record_membership(host, g.name)
         else:
             raise AnsibleError("Invalid empty host name provided: %s" % host)
 
@@ -236,13 +260,17 @@ class InventoryData:
         inv_object: Host | Group
 
         if entity in self.groups:
+            entity_type = _provenance.EntityType.GROUP
             inv_object = self.groups[entity]
         elif entity in self.hosts:
+            entity_type = _provenance.EntityType.HOST
             inv_object = self.hosts[entity]
         else:
             raise AnsibleError("Could not identify group or host named %s" % entity)
 
         inv_object.set_variable(varname, value)
+        if self._merge_tracker:
+            self._merge_tracker.record_variable(entity_type, entity, varname, value)
         display.debug('set %s for %s' % (varname, entity))
 
     def add_child(self, group: str, child: str) -> bool:
@@ -257,6 +285,11 @@ class InventoryData:
                 raise AnsibleError("%s is not a known host nor group" % child)
             self._groups_dict_cache = {}
             display.debug('Group %s now contains %s' % (group, child))
+            if self._merge_tracker:
+                if child in self.groups:
+                    self._merge_tracker.record_child_group(group, child)
+                else:
+                    self._merge_tracker.record_membership(child, group)
         else:
             raise AnsibleError("%s is not a known group" % group)
         return added

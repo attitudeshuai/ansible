@@ -21,6 +21,10 @@ EXAMPLES = """
 # all installed inventory plugins.
 """
 
+from __future__ import annotations
+
+import contextlib
+
 from ansible.errors import AnsibleParserError
 from ansible.plugins.inventory import BaseInventoryPlugin
 from ansible.plugins.loader import inventory_loader
@@ -62,8 +66,11 @@ class InventoryModule(BaseInventoryPlugin):
         # decisions based on the metadata the real plugin provides instead of our metadata
         inventory._target_plugin = plugin
 
-        plugin.parse(inventory, loader, path, cache=cache)
-        try:
-            plugin.update_cache_if_changed()
-        except AttributeError:
-            pass
+        # attribute provenance of everything the real plugin writes to it, while keeping 'auto' in the delegation chain
+        delegation = getattr(inventory, '_merge_delegation', lambda _plugin: contextlib.nullcontext())
+        with delegation(plugin):
+            plugin.parse(inventory, loader, path, cache=cache)
+            try:
+                plugin.update_cache_if_changed()
+            except AttributeError:
+                pass
